@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2
+
+Add an optional suppress-native-guidance pre-option. Apply it explicitly with
+Enable map or Apply settings; unsupported daemons keep the legacy map behavior.
+
 ## 0.4.1
 
 While CarPlay's stream is live but shows no map, the status says why, from

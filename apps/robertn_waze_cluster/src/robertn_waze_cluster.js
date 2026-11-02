@@ -32,6 +32,9 @@ const STATE_NAME = 'ST_OnlineApps_WazeCluster';
 const STATUS_NAME = 'wocStatus';
 const SETUP_NAME = 'wocSetup';
 const ENABLE_NAME = 'wocEnable';
+const NAVMD_NAME = 'wocNavmd';
+const WARNING_NAME = 'wocApplyWarning';
+const NAVMD_STATUS_NAME = 'wocNavmdStatus';
 const DISABLE_NAME = 'wocDisable';
 const RESTART_NAME = 'wocRestart';
 const CAPTURE_NAME = 'wocCapture';
@@ -131,13 +134,14 @@ class WazeClusterApp extends OnlineApp {
         if (!this._state) {
             return Promise.reject(new Error(`uiDescription has no ${STATE_NAME}`));
         }
-        const names = [STATUS_NAME, SETUP_NAME, ENABLE_NAME, DISABLE_NAME, RESTART_NAME, CAPTURE_NAME, CAPTURE_STATUS]
+        const names = [STATUS_NAME, SETUP_NAME, NAVMD_NAME, NAVMD_STATUS_NAME, WARNING_NAME, ENABLE_NAME, DISABLE_NAME, RESTART_NAME, CAPTURE_NAME, CAPTURE_STATUS]
             .concat(ROW_NAMES);
         names.forEach((name) => { this._components[name] = rhmi.getByName(name); });
         const missing = names.filter((name) => !this._components[name]);
         if (missing.length) {
             return Promise.reject(new Error(`uiDescription lacks ${missing.join(', ')}`));
         }
+        this._bind(NAVMD_NAME, () => this._control.toggleNavmd());
         this._bind(ENABLE_NAME, () => this._control.enableMap());
         this._bind(DISABLE_NAME, () => this._control.disableMap());
         this._bind(RESTART_NAME, () => this._control.requestRestart());
@@ -306,6 +310,11 @@ class WazeClusterApp extends OnlineApp {
         }
         this._write(STATUS_NAME, this._control.statusText());
         this._write(SETUP_NAME, SETUP_TEXT);
+        this._write(NAVMD_NAME, oneRow(this._control.navmdText()));
+        this._write(NAVMD_STATUS_NAME, oneRow(this._control.navmdStatusText()));
+        this._write(WARNING_NAME, 'Apply while parked; CarPlay may restart');
+        this._setEnabled(NAVMD_NAME, this._control.canToggleNavmd());
+        this._write(ENABLE_NAME, this._control.enableButtonText());
         this._write(CAPTURE_NAME, this._control.captureButtonText());
         this._write(CAPTURE_STATUS, this._control.captureText());
         const patch = this._control.connectedPatch();

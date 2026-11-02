@@ -329,15 +329,29 @@ Its sites:
 | selfstart | `onSuggestUi`'s `setStreamStatus(AVAILABLE)` call → `requestStream()` | rel32 at `0x18176c` |
 | resolution | IC_HIGH geometry → 1088x480 px at 138x61 mm, safe area 504x368+286+72 | four 8 B immediates at `0x20ca32`–`0x20ca7c` |
 
-There is a fifth, **optional** edit: `apply --navmd <anchor>` retargets
-CarPlay's guidance-metadata forward call to a bare `ret`, so the HMI's native
-banner (Apple Maps and Google Maps send `CPManeuver` metadata; Waze sends
-none) never lands on top of the rendered map. It stays off without the flag;
-the anchor — the forwarder's own name string — must be proven per build with
-a DLT capture first (PATCH.md "Edit 5"), and a build where the anchor does
-not resolve patches exactly as without the flag. status, verify and revert
-see the edit through `--navmd` or `WOC_NAVMD_ANCHOR`; keep the anchor in the
-config once applied, and `revert` restores the stock call byte-exact.
+There is a fifth, **optional** edit: CarPlay's guidance-metadata forward
+call can be retargeted to a verified `ret` to suppress the HMI's native banner.
+The app's “Suppress native guidance” pre-option is initially Off. Selecting On
+and pressing Enable map / Apply settings requests it; selecting Off and applying
+restores only that edit while retaining the map. Disable map restores all of this
+tool's edits. A deferred change still needs the next head-unit start.
+
+**No production anchor is proven yet.** The pre-option is unavailable until an
+administrator verifies an anchor for that build and provisions it to the root
+patch daemon. The daemon reads a single-line, root-owned, not group/world
+writable regular file `/var/opt/waze-on-cluster/navmd-anchor` (no symlinks), or
+`WOC_NAVMD_ANCHOR` in the daemon's own environment. Configuring an anchor by
+itself does not enable navmd. A validated prior edit's recorded identity can
+also provide its anchor. See PATCH.md “Edit 5” for validation and rollback.
+The locator conservatively refuses unsupported instruction shapes and return
+contracts; a passed structural check is not an on-car safety proof.
+
+Apply records the navmd identity in the original backup's metadata, so ordinary
+status/probe/verify/revert can recover it without re-entering the anchor. Normal
+core-only reapply preserves an existing optional edit. Legacy backups without
+that identity require the original anchor for reliable recovery; keep the backup
+until restoration is verified. Detection of legacy unrecorded edits is
+conservative, not exhaustive.
 
 `patchd` and the install hook apply `--panel high` with the stock sink.
 `woc-patch.sh` is the shell path, for experiments: `status`, `probe`,

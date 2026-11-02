@@ -67,6 +67,33 @@
             }
           ]
         },
+        "35": {
+          "type": "button",
+          "name": "wocNavmd",
+          "properties": {
+            "Visible": { "value": 1, "type": "UInt" },
+            "Focusable": { "value": 3, "type": "UInt" }
+          },
+          "rows": [ { "Text": { "value": "Suppress native guidance: Unavailable", "type": "Text" } } ]
+        },
+        "39": {
+          "type": "label",
+          "name": "wocNavmdStatus",
+          "properties": {
+            "Visible": { "value": 1, "type": "UInt" },
+            "Focusable": { "value": 0, "type": "UInt" }
+          },
+          "rows": [ { "Text": { "value": "Guidance status: Unavailable", "type": "Text" } } ]
+        },
+        "36": {
+          "type": "label",
+          "name": "wocApplyWarning",
+          "properties": {
+            "Visible": { "value": 1, "type": "UInt" },
+            "Focusable": { "value": 0, "type": "UInt" }
+          },
+          "rows": [ { "Text": { "value": "Apply while parked; CarPlay may restart", "type": "Text" } } ]
+        },
         "32": {
           "type": "button",
           "name": "wocEnable",

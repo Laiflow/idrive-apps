@@ -18,13 +18,13 @@
  *
  *   Patch daemon socket (PATCH_PATH; root helper, group tm_oap_app)
  *     app    -> daemon  {"cmd":"status"}
- *                       {"cmd":"apply","panel":"high","mode":"avb"}
+ *                       {"cmd":"apply","panel":"high","mode":"avb","navmd":true|false} (optional navmd)
  *                       {"cmd":"revert"}
  *                       {"cmd":"reboot"}  activate a deferred patch with a
  *                        normal reboot (only when carplay is "deferred")
  *     daemon -> app     {"ev":"status","state":"original"|"patched"|"unknown"|
  *                        "busy"|"error","panel":"high"|"mid"|null,"mode","res","safe",
- *                        "carplay","reason","pending","conflict"}
+ *                        "carplay","reason","pending","conflict","navmd"}
  *                       res "WxH" and safe "WxH+X+Y": the advertised size and
  *                       its safe area (a daemon before the safe area omits safe)
  *                       carplay "deferred": the patch is written but takes effect
@@ -60,6 +60,7 @@ const PATCH_PATH = '/dev/shm/waze-on-cluster/patch.sock';
 const PENDING_PATH = '/dev/shm/waze-on-cluster/activation-pending';
 const RETRY_MS = 1000;
 const MAX_LINES = 30;
+const OPERATION_TIMEOUT_MS = 120000;
 
 /* The native central-map slot's size, which the patch advertises to the phone. */
 const SIZE = '1088x480';
@@ -185,7 +186,8 @@ class LineSocket extends EventEmitter {
 }
 
 class WazeClusterControl extends EventEmitter {
-    /* options: renderPath, patchPath, pendingPath, retryMs, log ({info, warn}). Emits
+    /* options: renderPath, patchPath, pendingPath, retryMs, operationTimeoutMs,
+     * log ({info, warn}). The timeout defaults to 120 s. Emits
      * 'change' whenever statusText() or the connected() flags may
      * have changed, and 'log' when the merged log lines changed. */
     constructor(options) {
@@ -195,6 +197,13 @@ class WazeClusterControl extends EventEmitter {
         this._pendingPath = o.pendingPath || PENDING_PATH;
         this._lastPatchCmd = 'apply';
         this._restartRequested = false;   /* a reboot was asked for; waiting for the unit to restart */
+        this._navmdChoice = false;       /* pre-option defaults off */
+        this._navmdDirty = false;
+        this._operation = null;          /* sent operation awaiting authoritative status */
+        this._operationTimeoutMs = o.operationTimeoutMs || OPERATION_TIMEOUT_MS;
+        this._operationTimer = null;
+        this._needsFreshStatus = false;
+        this._outcomeUncertain = false;
         this.captureState = { state: 'unavailable' };
         this.renderStatus = null;   /* the render tool's last status while connected */
         this.patchStatus = null;    /* the patch daemon's last status while connected */
@@ -217,8 +226,12 @@ class WazeClusterControl extends EventEmitter {
          * are dropped first to keep the merged log free of duplicates. */
         this.render.on('connect', () => this._onLinkChange('map', () => { this.renderStatus = null; }));
         this.render.on('close', () => { this.renderStatus = null; this.emit('change'); });
-        this.patch.on('connect', () => this._onLinkChange('patch', () => { this.patchStatus = null; }));
-        this.patch.on('close', () => { this.patchStatus = null; this._restartRequested = false; this.emit('change'); });
+        this.patch.on('connect', () => {
+            this._onLinkChange('patch', () => { this.patchStatus = null; });
+            if (this._operation && !this._operation.deferred) this._armOperationTimer();
+            if (this._needsFreshStatus) this.patch.send({ cmd: 'status' });
+        });
+        this.patch.on('close', () => { this._patchDisconnected(); this.emit('change'); });
     }
 
     /* Open both sockets, each reconnecting while open. */
@@ -232,8 +245,47 @@ class WazeClusterControl extends EventEmitter {
         this.render.close();
         this.patch.close();
         this.renderStatus = null;
-        this.patchStatus = null;
+        this._patchDisconnected();
         this.emit('change');
+    }
+
+    _patchDisconnected() {
+        this.patchStatus = null;
+        this._restartRequested = false;
+        this._stopOperationTimer();
+        if (this._operation) this._operation.reconnect = true;
+    }
+
+    _stopOperationTimer() {
+        if (this._operationTimer) clearTimeout(this._operationTimer);
+        this._operationTimer = null;
+    }
+
+    _armOperationTimer() {
+        this._stopOperationTimer();
+        this._operationTimer = setTimeout(() => {
+            this._operationTimer = null;
+            if (!this._operation || this._operation.deferred) return;
+            this._operation = null;
+            this._outcomeUncertain = true;
+            this._needsFreshStatus = true;
+            this.patchStatus = null;
+            /* Drop the old socket so buffered pre-request statuses cannot be
+             * mistaken for the refresh. The new connection requests status. */
+            if (this.patch._open) {
+                this.patch.close();
+                this.patch.open();
+            } else if (this.connectedPatch()) {
+                this.patch.send({ cmd: 'status' });
+            }
+            this.emit('change');
+        }, this._operationTimeoutMs);
+        if (this._operationTimer.unref) this._operationTimer.unref();
+    }
+
+    _finishOperation() {
+        this._stopOperationTimer();
+        this._operation = null;
     }
 
     connectedRender() {
@@ -245,15 +297,76 @@ class WazeClusterControl extends EventEmitter {
     }
 
     /* ---- controls ---- */
+    _navmdState() {
+        const nav = this.patchStatus && this.patchStatus.navmd;
+        return nav && ['on', 'off', 'unavailable', 'unknown'].includes(nav.state) ? nav.state : 'unavailable';
+    }
+
+    canToggleNavmd() {
+        const ps = this.patchStatus;
+        return !!(this.connectedPatch() && ps && !this._restartRequested && !this._operation &&
+            !this._needsFreshStatus && !this.pending() && ps.state !== 'busy' && ['on', 'off'].includes(this._navmdState()));
+    }
+
+    toggleNavmd() {
+        if (!this.canToggleNavmd()) return;
+        this._navmdChoice = !this._navmdChoice;
+        this._navmdDirty = this._navmdChoice !== (this._navmdState() === 'on');
+        this.emit('change');
+    }
+
+    navmdText() {
+        const state = this._navmdState();
+        if (this._navmdDirty) {
+            return 'Suppress native guidance: ' + (this._navmdChoice ? 'On' : 'Off') +
+                ' — not applied' + (this.pending() ? ' (reboot needed)' : '');
+        }
+        if (!['on', 'off'].includes(state)) {
+            return 'Suppress native guidance: ' + (state === 'unknown' ? 'Unknown' : 'Unavailable');
+        }
+        return 'Suppress native guidance: ' + (this._navmdChoice ? 'On' : 'Off') +
+            (this.pending() ? ' — reboot needed' : '');
+    }
+
+    navmdStatusText() {
+        const state = this._navmdState();
+        const nav = this.patchStatus && this.patchStatus.navmd;
+        if (!['on', 'off'].includes(state)) {
+            const fallback = !this.connectedPatch() ? 'patch service disconnected' :
+                !this.patchStatus ? 'waiting for patch status' :
+                !nav ? 'daemon does not report this option' :
+                'no root-provisioned verified anchor or status cannot be verified';
+            return 'Guidance status: ' + (state === 'unknown' ? 'Unknown' : 'Unavailable') +
+                ' — ' + ((nav && typeof nav.reason === 'string' && nav.reason) || fallback);
+        }
+        return 'Guidance on disk: ' + (state === 'on' ? 'On' : 'Off') +
+            (this.pending() ? ' — reboot needed' : '');
+    }
+
+    enableButtonText() {
+        return this.patchStatus && this.patchStatus.state === 'patched' ? 'Apply settings' : 'Enable map';
+    }
+
     enableMap() {
+        if (!this.canEnable()) return;
         this._lastPatchCmd = 'apply';
-        /* The stock media-bus sink: the capture path the render joins. */
-        this.patch.send({ cmd: 'apply', panel: 'high', mode: 'avb' });
+        this._outcomeUncertain = false;
+        const msg = { cmd: 'apply', panel: 'high', mode: 'avb' };
+        if (['on', 'off'].includes(this._navmdState())) msg.navmd = this._navmdChoice;
+        this._operation = { cmd: 'apply', choice: msg.navmd, sawBusy: false, reconnect: false };
+        this._armOperationTimer();
+        this.patch.send(msg);
+        this.emit('change');
     }
 
     disableMap() {
+        if (!this.canDisable()) return;
         this._lastPatchCmd = 'revert';
+        this._outcomeUncertain = false;
+        this._operation = { cmd: 'revert', sawBusy: false, reconnect: false };
+        this._armOperationTimer();
         this.patch.send({ cmd: 'revert' });
+        this.emit('change');
     }
 
     /* True while the daemon reports a written patch that takes effect only at
@@ -296,17 +409,18 @@ class WazeClusterControl extends EventEmitter {
      * unknown or failed state, or an outdated patch, with nothing pending. */
     canEnable() {
         const ps = this.patchStatus;
-        if (!this.connectedPatch() || this._restartRequested || !ps || this.pending()) {
+        if (!this.connectedPatch() || this._restartRequested || !ps || this._needsFreshStatus || this.pending() || this._operation) {
             return false;
         }
-        return ['original', 'unknown', 'error'].includes(ps.state) || (ps.state === 'patched' && this._outdated(ps));
+        return ['original', 'unknown', 'error'].includes(ps.state) || (ps.state === 'patched' && (this._outdated(ps) ||
+            (this._navmdDirty && ['on', 'off'].includes(this._navmdState()))));
     }
 
     /* Disable map is offered for a patch, or a state that may be one, with
      * nothing pending. */
     canDisable() {
         const ps = this.patchStatus;
-        if (!this.connectedPatch() || this._restartRequested || !ps || this.pending()) {
+        if (!this.connectedPatch() || this._restartRequested || !ps || this._needsFreshStatus || this.pending() || this._operation) {
             return false;
         }
         return ['patched', 'unknown', 'error'].includes(ps.state);
@@ -346,6 +460,7 @@ class WazeClusterControl extends EventEmitter {
     /* The patch state gates the flow, then the render state drives the line. */
     statusText() {
         const p = this.patch.link;
+        if (this._needsFreshStatus) return 'Operation unconfirmed — refreshing patch status…';
         if (p === 'down') {
             return 'Connecting…';
         }
@@ -363,6 +478,9 @@ class WazeClusterControl extends EventEmitter {
             return 'Restarting head unit…';
         }
         const ps = this.patchStatus;
+        if (this._operation && !this._operation.sawBusy && !this._operation.reconnect) {
+            return this._operation.cmd === 'revert' ? 'Reverting patch…' : 'Applying patch…';
+        }
         const state = ps && ps.state;
         if (state === 'busy') {
             return this._lastPatchCmd === 'revert' ? 'Reverting patch…' : 'Applying patch…';
@@ -374,6 +492,7 @@ class WazeClusterControl extends EventEmitter {
         if (pending) {
             return `Restart needed — ${ps.reason || 'restart to activate the map patch'}`;
         }
+        if (this._outcomeUncertain) return 'Operation unconfirmed — check status before retrying';
         if (state === 'original') {
             return ps.conflict ? `Not patched — ${ps.conflict}` : 'Original — enable the map';
         }
@@ -437,6 +556,33 @@ class WazeClusterControl extends EventEmitter {
             this.emit('change');
         } else if (msg.ev === 'status') {
             this.patchStatus = msg;
+            this._needsFreshStatus = false;
+            const op = this._operation;
+            if (op && msg.state === 'busy') op.sawBusy = true;
+            if (op && msg.state === 'error') {
+                this._finishOperation();
+            } else if (op && msg.state !== 'busy' && (op.sawBusy || op.reconnect)) {
+                if (op.cmd === 'apply' && op.sawBusy && typeof op.choice === 'boolean' &&
+                    msg.state === 'patched' && !this.pending() &&
+                    this._navmdState() === (op.choice ? 'on' : 'off') &&
+                    this._navmdChoice === op.choice) {
+                    this._navmdDirty = false;
+                    this._finishOperation();
+                } else if (op.cmd === 'apply' && this.pending()) {
+                    /* Reconcile after reboot, never claim the running process changed now. */
+                    op.reconnect = true;
+                    op.deferred = true;
+                    this._stopOperationTimer();
+                } else {
+                    if (!op.sawBusy) this._outcomeUncertain = true;
+                    this._finishOperation();
+                }
+            }
+            /* An operation error does not invalidate a verified disk probe. */
+            if (!this._navmdDirty && !this._operation && ['on', 'off'].includes(this._navmdState()) &&
+                msg.state !== 'busy') {
+                this._navmdChoice = this._navmdState() === 'on';
+            }
             this.emit('change');
         } else if (msg.ev === 'reboot-reply') {
             /* A refused request (nothing pending, busy, or already restarting)

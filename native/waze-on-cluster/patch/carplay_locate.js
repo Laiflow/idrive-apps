@@ -502,25 +502,121 @@ function version(buf) {
 
 /* ---- Edit 5 (optional): the guidance-metadata forward call ---------------- */
 
-/* CarPlay hands guidance metadata (CPManeuver, CPLaneGuidance on the phone) to
- * the HMI through its own forwarder, and the HMI draws its native banner on
- * top of the cluster map. Silencing that one forward call leaves the video
- * path untouched. The forwarder is found by its own name string, like the
- * self-start trio: the anchor is `substring` or `substring/regex` naming that
- * string, proven per build (PATCH.md, Edit 5). The forwarder must not be one
- * of the video-path trio, must not call one, and must have exactly one caller
- * in the whole image: that `call` (5 bytes) is the edit.
- *
- * The patched form retargets the call to the forwarder's terminating ret. A
- * call into a bare ret pushes and pops the same return address — no register,
- * flag or net stack effect — so it is a no-op, and it is still a call pointed
- * at the forwarder's last byte: the patched state locates (one call to that
- * address, none to the forwarder itself) and reads back to the stock rel32. */
+/* Optional-only, deliberately small x86-64 whitelist, NOT a disassembler.
+ * Encoding reference: Intel SDM Vol. 2, Instruction Format; CALL/JMP/RET,
+ * LEA, MOV and XOR (REX, ModRM, displacement and immediate sizes):
+ * https://cdrdv2-public.intel.com/835757/325383-sdm-vol-2abcd.pdf
+ * Only the forms below are supported. Legacy prefixes, extra REX prefixes,
+ * memory operands other than RIP-relative LEA, indirect control flow and
+ * unknown opcodes fail closed. Never reuse this for the four legacy scans.
+ * Decoding starts at the function-table entry, never at a candidate E8/C3.
+ */
+function navmdInstruction(im, p, end) {
+    var b = im.buf, op = b[p], n = 0, kind = 'other', to = null, dest = null;
+    if (op === 0x90) { n = 1; kind = 'nop'; }
+    else if (op === 0xc3) { n = 1; kind = 'ret'; }
+    else if (op === 0xe8 || op === 0xe9) {
+        n = 5; kind = op === 0xe8 ? 'call' : 'jump';
+        if (p + n <= end) to = im.rel(p + 1, p + n);
+    } else if (op === 0xeb || (op >= 0x70 && op <= 0x7f)) {
+        n = 2; kind = 'jump';
+        if (p + n <= end) to = im.off(im.va(p + n) + b.readInt8(p + 1));
+    } else if (op === 0x0f && b[p + 1] >= 0x80 && b[p + 1] <= 0x8f) {
+        n = 6; kind = 'jump';
+        if (p + n <= end) to = im.rel(p + 2, p + n);
+    } else if (op >= 0xb8 && op <= 0xbf) { n = 5; dest = op - 0xb8; } /* MOV r32,imm32 */
+    else if (op >= 0x48 && op <= 0x4f && b[p + 1] >= 0xb8 && b[p + 1] <= 0xbf) {
+        n = 10; dest = b[p + 1] - 0xb8 + ((op & 1) ? 8 : 0);
+    } /* REX.W MOV r64,imm64: its E8/C3 bytes are data */
+    else if ((op === 0x48 || op === 0x4c) && b[p + 1] === 0x8d && (b[p + 2] & 0xc7) === 0x05) {
+        n = 7; kind = 'lea'; dest = ((b[p + 2] >> 3) & 7) + (op === 0x4c ? 8 : 0);
+        /* mod=00, r/m=101: RIP + disp32, no SIB */
+    } else if ((op === 0x31 || op === 0x33) && (b[p + 1] & 0xc0) === 0xc0) {
+        n = 2; kind = 'xor'; dest = op === 0x31 ? (b[p + 1] & 7) : ((b[p + 1] >> 3) & 7);
+        /* only register-register XOR r32,r32 */
+    }
+    return n && p + n <= end ? { at: p, end: p + n, kind: kind, to: to, dest: dest } : null;
+}
+
+/* A single straight-line body ending at a decoded RET, followed ONLY by
+ * alignment bytes. In particular, a trailing C3 in a literal is not a RET.
+ * Branching/indirect bodies are outside this optional edit's supported set. */
+function navmdBody(im, f) {
+    var ins = [], p = f.off;
+    while (p < f.end) {
+        var d = navmdInstruction(im, p, f.end);
+        if (!d) return { err: 'unsupported instruction encoding at ' + p };
+        ins.push(d); p = d.end;
+        if (d.kind === 'ret') {
+            for (var q = p; q < f.end; q++)
+                if ([0, 0x90, 0xcc].indexOf(im.buf[q]) < 0)
+                    return { err: 'non-padding after decoded ret' };
+            return { ins: ins, ret: d.at, end: d.end };
+        }
+        if (d.kind === 'jump') return { err: 'direct jump/branch in body (video-path safety not proven)' };
+    }
+    return { err: 'forwarder does not end in ret' };
+}
+
+/* Enumerate POSSIBLE direct incoming edges, including tail jumps. These are
+ * rejection candidates only: an E8 inside an immediate cannot authorize an
+ * edit. Every accepted call is subsequently decoded from its caller entry.
+ * Extra ambiguous edges (even embedded data) intentionally cause refusal. */
+function navmdEdges(im, targets) {
+    var out = [], b = im.buf;
+    for (var p = im.exec.off; p < im.exec.end; p++) {
+        var op = b[p], n = 0, disp = 0, call = false;
+        if (op === 0xe8 || op === 0xe9) { n = 5; disp = 1; call = op === 0xe8; }
+        else if (op === 0xeb || (op >= 0x70 && op <= 0x7f)) { n = 2; disp = 1; }
+        else if (op === 0x0f && b[p + 1] >= 0x80 && b[p + 1] <= 0x8f) { n = 6; disp = 2; }
+        if (!n || p + n > im.exec.end) continue;
+        var next = im.va(p + n);
+        var to = next === null ? null : im.off(next + (n === 2 ? b.readInt8(p + disp) : b.readInt32LE(p + disp)));
+        if (targets.indexOf(to) >= 0) out.push({ at: p, to: to, call: call });
+    }
+    return out;
+}
+
+/* A strict void self-name is necessary, but not sufficient: a mismatched
+ * caller can consume RAX even for void ABI. The accepted caller suffix is
+ * NOP* [XOR EAX,EAX; XOR EDX,EDX] NOP* RET, nothing else. For the bare-RET
+ * suffix, also require a leaf forwarder made ONLY of NOPs and RIP-relative
+ * LEAs to non-return caller-saved registers: stock and patched leave RAX/RDX
+ * (and FP return registers/flags) identical. Thus CALL;RET synthetic dispatchers
+ * remain supported without assuming that their absent signature means void.
+ * The explicit zeroing suffix instead discards both integer return registers;
+ * only leaf bodies writing caller-saved GPRs are then allowed, so FP return
+ * registers are unchanged as well (an external CALL could change them).
+ * All other shapes are refused.
+ */
+function navmdReturnSafe(im, body, caller, at) {
+    /* Never skip a write to stack/callee-saved state, even for a void name. */
+    if (body.ins.some(function (d) { return d.dest !== null && [0, 1, 2, 6, 7, 8, 9, 10, 11].indexOf(d.dest) < 0; }))
+        return false;
+    var suffix = caller.ins.filter(function (d) { return d.at > at; });
+    var useful = suffix.filter(function (d) { return d.kind !== 'nop'; });
+    if (useful.length === 3 && useful[0].kind === 'xor' && useful[1].kind === 'xor' && useful[2].kind === 'ret' &&
+        im.buf[useful[0].at] === 0x31 && im.buf[useful[0].at + 1] === 0xc0 &&
+        im.buf[useful[1].at] === 0x31 && im.buf[useful[1].at + 1] === 0xd2)
+        return !body.ins.some(function (d) { return d.kind === 'call'; });
+    if (useful.length !== 1 || useful[0].kind !== 'ret') return false;
+    return body.ins.every(function (d) {
+        if (d.kind === 'ret' || d.kind === 'nop') return true;
+        if (d.kind !== 'lea') return false;
+        return d.dest !== 0 && d.dest !== 2; /* no return-register write */
+    });
+}
+
+/* The optional call retarget requires a decoded self-name load and RET,
+ * decoded incoming CALL boundary, no incoming tail jumps and no video-trio
+ * caller/callee. Unsupported encodings or return use refuse only Edit 5. */
 function locateNavmd(im, anchor, trio) {
     if (!im.starts.length) return { ok: false, reason: 'navmd: no function table' };
     if (!anchor) return { ok: false, reason: 'navmd: no anchor given' };
     if (trio.err) return { ok: false, reason: 'navmd: ' + trio.err };
     var sep = anchor.indexOf('/'), re = null, key = sep < 0 ? anchor : anchor.slice(0, sep);
+    /* An empty Buffer search never advances beyond EOF; refuse before namedString. */
+    if (!key.trim()) return { ok: false, reason: 'navmd: anchor substring must not be empty or whitespace-only' };
     if (sep >= 0) {
         try { re = new RegExp(anchor.slice(sep + 1)); }
         catch (e) { return { ok: false, reason: 'navmd: bad anchor regex: ' + e.message }; }
@@ -535,29 +631,40 @@ function locateNavmd(im, anchor, trio) {
         if (!g || g.off !== f.off) return { ok: false, reason: 'navmd: anchor used by several functions' };
     }
     if (!f) return { ok: false, reason: 'navmd: forwarder outside the function table' };
-    /* The no-op target: the forwarder's terminating ret, found past the
-     * function's tail padding (the function-table end covers it). */
-    var e = f.end - 1;
-    while (e > f.off && (im.buf[e] === 0x00 || im.buf[e] === 0x90 || im.buf[e] === 0xcc)) e--;
-    if (im.buf[e] !== 0xc3) return { ok: false, reason: 'navmd: forwarder does not end in ret' };
-    var retVa = im.va(e);
+    if (!/^void (?:[A-Za-z_]\w*::)+[A-Za-z_]\w*\([^()]*\)$/.test(stringAt(im.buf, str.off)))
+        return { ok: false, reason: 'navmd: forwarder self-name is not an unambiguous void signature' };
     if (trio.list.indexOf(f.off) >= 0) return { ok: false, reason: 'navmd: forwarder is on the video path' };
-    var inner = im.calls(f.off, f.end);
-    for (var j = 0; j < inner.length; j++)
-        if (trio.list.indexOf(inner[j].to) >= 0) return { ok: false, reason: 'navmd: forwarder calls the video path' };
-    var all = im.calls(im.exec.off, im.exec.end), toF = [], toRet = [];
-    for (var k = 0; k < all.length; k++) {
-        if (all[k].to === f.off) toF.push(all[k]);
-        if (all[k].to === e) toRet.push(all[k]);
-    }
-    var stock = toF.length === 1 && toRet.length === 0, patched = toF.length === 0 && toRet.length === 1;
-    if (!stock && !patched) return { ok: false, reason: 'navmd: forwarder called ' + (toF.length + toRet.length) + ' times (want 1)' };
-    var at = (stock ? toF : toRet)[0], caller = im.func(at.at);
+    var body = navmdBody(im, f);
+    if (body.err) return { ok: false, reason: 'navmd: forwarder ' + body.err };
+    if (!sites.some(function (p) {
+        return p - f.off < ENTRY && body.ins.some(function (d) { return d.at === p && d.kind === 'lea'; });
+    })) return { ok: false, reason: 'navmd: self-name load is not a decoded entry instruction' };
+    for (var j = 0; j < body.ins.length; j++)
+        if (body.ins[j].kind === 'call' && trio.list.indexOf(body.ins[j].to) >= 0)
+            return { ok: false, reason: 'navmd: forwarder calls the video path' };
+    var e = body.ret, retVa = im.va(e), edges = navmdEdges(im, [f.off, e]);
+    if (edges.some(function (c) { return !c.call; }))
+        return { ok: false, reason: 'navmd: incoming direct tail jump/branch to forwarder or ret' };
+    if (edges.length !== 1)
+        return { ok: false, reason: 'navmd: forwarder called ' + edges.length + ' times (want 1)' };
+    var at = edges[0], caller = im.func(at.at);
     if (!caller) return { ok: false, reason: 'navmd: caller outside the function table' };
     if (trio.list.indexOf(caller.off) >= 0) return { ok: false, reason: 'navmd: caller is on the video path' };
+    var cb = navmdBody(im, caller);
+    if (cb.err) return { ok: false, reason: 'navmd: caller ' + cb.err };
+    if (!cb.ins.some(function (d) { return d.at === at.at && d.kind === 'call' && d.to === at.to; }))
+        return { ok: false, reason: 'navmd: candidate call is not a decoded instruction boundary' };
+    if (!navmdReturnSafe(im, body, cb, at.at))
+        return { ok: false, reason: 'navmd: caller return-value safety not proven' };
     var next = im.va(at.at + 5);
-    if (next === null) return { ok: false, reason: 'navmd: call site at the end of the image' };
-    return { ok: true, offset: at.at, caller: caller.off, forwarder: f.off,
+    if (next === null || retVa === null) return { ok: false, reason: 'navmd: call site/ret at the end of the image' };
+    /* Protect both the edit and its evidence, including the RET byte that
+     * the loader must not rewrite. The legacy four-edit checks stay intact. */
+    var proof = relocated(im, [['navmd', f.off, body.end - f.off],
+        ['navmd', caller.off, cb.end - caller.off], ['navmd', str.off, stringAt(im.buf, str.off).length + 1]]);
+    if (proof.all || proof.edits.length)
+        return { ok: false, reason: 'navmd: ' + (proof.all || 'a dynamic relocation over the edit or decoded safety evidence') };
+    return { ok: true, offset: at.at, caller: caller.off, forwarder: f.off, ret: e,
              original: 'e8' + hex32(im.va(f.off) - next), patched: 'e8' + hex32(retVa - next) };
 }
 

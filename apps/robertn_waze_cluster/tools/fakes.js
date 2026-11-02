@@ -165,6 +165,9 @@ class FakePatch extends LineServer {
         this.safe = null;   /* and its safe area: "WxH+X+Y" */
         this.carplay = null;  /* 'deferred' once a patch is written but not active */
         this.pending = null;  /* 'apply' | 'revert': the change waiting for a head-unit start */
+        this.navmd = null; /* absent by default: an older daemon */
+        this.deferApply = false;
+        this.failApply = false;
         this.conflict = null; /* why the install left carplay as it was */
         this.busy = false;
         this.reason = null;
@@ -182,9 +185,11 @@ class FakePatch extends LineServer {
     }
 
     _status() {
-        return { ev: 'status', state: this.busy ? 'busy' : this.state, panel: this.panel,
+        const status = { ev: 'status', state: this.busy ? 'busy' : this.state, panel: this.panel,
             res: this.res, safe: this.safe, carplay: this.carplay, reason: this.reason,
             pending: this.pending, conflict: this.conflict };
+        if (this.navmd) status.navmd = this.busy ? {state:'unknown', reason:'patch operation in progress'} : this.navmd;
+        return status;
     }
 
     _onConnect(socket) {
@@ -225,6 +230,12 @@ class FakePatch extends LineServer {
             this._broadcast(this._status());
             this._timer = setTimeout(() => {
                 this.busy = false;
+                if (this.failApply) {
+                    this.state = 'error';
+                    this.reason = 'write failed';
+                    this._broadcast(this._status());
+                    return;
+                }
                 this.state = 'patched';
                 this.panel = msg.panel;
                 /* The geometry the patcher writes: the high panel's size and
@@ -232,6 +243,12 @@ class FakePatch extends LineServer {
                 this.res = msg.panel === 'high' ? '1088x480' : null;
                 this.safe = msg.panel === 'high' ? '504x368+286+72' : null;
                 this.reason = 'restarted';
+                if (this.navmd && typeof msg.navmd === 'boolean') this.navmd = { state: msg.navmd ? 'on' : 'off' };
+                if (this.deferApply) {
+                    this.state = 'unknown';
+                    this.pending = 'apply';
+                    this.carplay = 'deferred';
+                }
                 this.log('apply done');
                 this._broadcast(this._status());
             }, STEP_MS);

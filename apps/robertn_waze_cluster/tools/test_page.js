@@ -26,10 +26,8 @@ const path = require('path');
 const { FakeRender, FakePatch, RENDER_PAGE, RENDER_FPS } = require('./fakes.js');
 const { RENDER_PATH, PATCH_PATH, PENDING_PATH, SIZE, SAFE } = require('../src/waze_cluster_control.js');
 
-const STAGED = fs.readdirSync(path.join(__dirname, '..'))
-    .find((name) => name.startsWith('robertn_waze_cluster@') && !name.endsWith('.tgz'));
-const PKG = path.join(__dirname, '..', STAGED);
 const MANIFEST = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'mgu-app.json'), 'utf8'));
+const PKG = path.join(__dirname, '..', MANIFEST.tree);
 const UI_DIR = path.join(PKG, 'rhmiData', 'uiDescriptions', 'ID7');
 const UI = JSON.parse(fs.readFileSync(path.join(UI_DIR, 'uiDescription.json'), 'utf8'));
 const XML = fs.readFileSync(path.join(UI_DIR, 'application.xml'), 'utf8');
@@ -147,10 +145,19 @@ function runSource() {
 async function main() {
     const components = UI.containers['1'].components;
     const buttons = Object.entries(components).filter(([, d]) => d.type === 'button');
-    const xmlButtons = [...XML.matchAll(/<component id="(\d+)" type="button"/g)].map((m) => m[1]).sort();
+    const xmlButtons = [];
+    const buttonPattern = /<component id="(\d+)" type="button"/g;
+    let buttonMatch;
+    while ((buttonMatch = buttonPattern.exec(XML))) xmlButtons.push(buttonMatch[1]);
+    xmlButtons.sort();
     assert.deepStrictEqual(buttons.map(([id]) => id).sort(), xmlButtons, 'application.xml and uiDescription agree');
-    assert.deepStrictEqual(buttons.map(([, d]) => d.name).sort(), ['wocCapture', 'wocDisable', 'wocEnable', 'wocRestart']);
+    assert.deepStrictEqual(buttons.map(([, d]) => d.name).sort(), ['wocCapture', 'wocDisable', 'wocEnable', 'wocNavmd', 'wocRestart']);
     assert(!buttons.some(([, d]) => /^(Show|Stop)$/.test(d.rows[0].Text.value)), 'no Show or Stop button');
+    Object.entries(components).forEach(([id, desc]) => {
+        assert(new RegExp('<component id="' + id + '" type="' + desc.type + '"').test(XML), 'XML component/type ' + id);
+    });
+    assert.strictEqual(components['36'].type, 'label');
+    assert.strictEqual(components['36'].properties.Focusable.value, 0);
     /* The restart button ships hidden; it shows only while a patch is deferred. */
     assert.strictEqual(components['34'].properties.Visible.value, 0, 'wocRestart ships hidden');
     console.log('ok   page buttons: Enable map, Disable map, Restart (hidden), Capture logs; no Show or Stop');
@@ -166,7 +173,9 @@ async function main() {
     await patch.listen();
     patch.res = SIZE;
     patch.safe = SAFE;
-    patch.announce('patched', 'high', null);
+    patch.navmd = {state:'on'};
+    patch.pending = 'apply';
+    patch.announce('unknown', 'high', null, 'deferred');
     render.stream(true);
     await until('fake showing', () => render.state === 'showing');
 
@@ -174,10 +183,16 @@ async function main() {
         process.exit = (code) => { throw new Error(`process.exit(${code})`); };
         runSource();
         const status = byName.wocStatus;
+        await until('fresh pending on', () => byName.wocNavmd.text === 'Suppress native guidance: On — reboot needed' &&
+            byName.wocNavmdStatus.text === 'Guidance on disk: On — reboot needed' && !byName.wocNavmd.enabled);
+        patch.navmd = {state:'off'}; patch._broadcast(patch._status());
+        await until('fresh pending off', () => byName.wocNavmd.text === 'Suppress native guidance: Off — reboot needed');
+        patch.navmd = null; patch.pending = null; patch.announce('patched', 'high', null);
         await until('page shows the map', () => status.text === `Showing: ${RENDER_PAGE} — ${RENDER_FPS}`);
+        assert.strictEqual(byName.wocApplyWarning.text, 'Apply while parked; CarPlay may restart');
         assert(!logs.some((l) => /^error/.test(l)), logs.filter((l) => /^error/.test(l)).join('\n'));
         const bound = logs.filter((l) => l.startsWith('info: BIND OK: ')).map((l) => l.split(' ')[3]).sort();
-        assert.deepStrictEqual(bound, ['wocCapture', 'wocDisable', 'wocEnable', 'wocRestart'], 'bound buttons');
+        assert.deepStrictEqual(bound, ['wocCapture', 'wocDisable', 'wocEnable', 'wocNavmd', 'wocRestart'], 'bound buttons');
         assert.strictEqual(byName.wocRestart.visible, false, 'restart button hidden while the map shows');
         console.log('ok   a page opened while the map is up shows it');
         await until('the setup line', () => byName.wocSetup.text === 'Set Instrument cluster > Central display area to Map view');
@@ -193,6 +208,92 @@ async function main() {
         await until('apply and capture sent', () => patch.count('apply') === 1 && patch.count('capture-start') === 1 && !patch.busy);
         assert.deepStrictEqual(render.received, [], 'no command to the render');
         console.log('ok   Disable map while patched, Enable map while not; presses go to the patch daemon, none to the render');
+
+        assert.strictEqual(byName.wocNavmd.enabled, false);
+        assert(byName.wocNavmdStatus.text.includes('daemon does not report'));
+        assert.deepStrictEqual(patch.received.filter((m) => m.cmd === 'apply')[0],
+            {cmd:'apply',panel:'high',mode:'avb'});
+        patch.navmd = {state:'off'};
+        patch.announce('patched', 'high', null);
+        await until('navmd off', () => byName.wocNavmd.text === 'Suppress native guidance: Off' && byName.wocNavmd.enabled);
+        const applyCount = patch.count('apply');
+        byName.wocNavmd.emit('action');
+        await until('dirty setting', () => byName.wocNavmd.text.includes('On — not applied') &&
+            byName.wocEnable.visible && byName.wocEnable.text === 'Apply settings');
+        assert.strictEqual(byName.wocNavmdStatus.text, 'Guidance on disk: Off');
+        assert.strictEqual(patch.count('apply'), applyCount, 'selection alone sends no command');
+        await sleep(450); byName.wocNavmd.emit('action');
+        await until('toggled back, no apply', () => byName.wocNavmd.text === 'Suppress native guidance: Off' && !byName.wocEnable.visible);
+        await sleep(450); byName.wocNavmd.emit('action');
+        await until('staged again', () => byName.wocNavmd.text.includes('On — not applied') && byName.wocEnable.visible);
+        patch._broadcast(patch._status());
+        await sleep(50);
+        assert(byName.wocNavmd.text.includes('On — not applied'), 'refresh keeps dirty selection');
+        await sleep(450); // enable action deduplication from the earlier legacy apply
+        byName.wocEnable.emit('action');
+        await until('busy preserves staged choice', () => status.text === 'Applying patch…' &&
+            byName.wocNavmd.text.includes('On — not applied') && !byName.wocNavmd.enabled);
+        await until('navmd on applied', () => patch.count('apply') === applyCount + 1 &&
+            byName.wocNavmd.text === 'Suppress native guidance: On');
+        assert.deepStrictEqual(patch.received.filter((m) => m.cmd === 'apply').slice(-1)[0],
+            {cmd:'apply',panel:'high',mode:'avb',navmd:true});
+        await sleep(450);
+        byName.wocNavmd.emit('action');
+        await until('dirty off', () => byName.wocNavmd.text.includes('Off — not applied') && byName.wocEnable.visible);
+        await sleep(450);
+        byName.wocEnable.emit('action');
+        await until('navmd off applied', () => patch.count('apply') === applyCount + 2 &&
+            byName.wocNavmd.text === 'Suppress native guidance: Off');
+        assert.deepStrictEqual(patch.received.filter((m) => m.cmd === 'apply').slice(-1)[0],
+            {cmd:'apply',panel:'high',mode:'avb',navmd:false});
+        await sleep(450);
+        byName.wocNavmd.emit('action');
+        await until('staged for failing apply', () => byName.wocNavmd.text.includes('On — not applied'));
+        patch.failApply = true;
+        await sleep(450);
+        byName.wocEnable.emit('action');
+        await until('failed apply remains staged', () => status.text === 'Patch error: write failed' &&
+            byName.wocNavmd.text.includes('On — not applied'));
+        assert.deepStrictEqual(patch.received.filter((m) => m.cmd === 'apply').slice(-1)[0],
+            {cmd:'apply',panel:'high',mode:'avb',navmd:true});
+        patch.failApply = false;
+        patch.announce('patched', 'high', null);
+        await until('failure refresh preserves selection', () => byName.wocNavmd.text.includes('On — not applied'));
+        patch.navmd = {state:'unavailable',reason:'No root-provisioned verified anchor'};
+        patch._broadcast(patch._status());
+        await until('unsupported reason', () => !byName.wocNavmd.enabled && byName.wocNavmdStatus.text.includes('verified anchor'));
+        await sleep(450);
+        byName.wocNavmd.emit('action');
+        assert.strictEqual(patch.count('apply'), applyCount + 3);
+        patch.navmd = {state:'unknown',reason:'verification failed'};
+        patch._broadcast(patch._status());
+        await until('unknown reason', () => !byName.wocNavmd.enabled && byName.wocNavmdStatus.text.includes('verification failed'));
+        patch.navmd = null;
+        patch._broadcast(patch._status());
+        await until('old daemon', () => !byName.wocNavmd.enabled && byName.wocNavmdStatus.text.includes('daemon does not report'));
+        patch.navmd = {state:'off'};
+        patch._broadcast(patch._status());
+        await until('option reavailable', () => byName.wocNavmd.enabled);
+        await until('dirty before reconnect', () => byName.wocNavmd.text.includes('On — not applied'));
+        byName.ST_OnlineApps_WazeCluster.emit('visible', { visible: false });
+        await until('closed for dirty reconnect', () => patch._clients.size === 0);
+        byName.ST_OnlineApps_WazeCluster.emit('visible', { visible: true });
+        await until('dirty after reconnect', () => byName.wocNavmd.enabled && byName.wocNavmd.text.includes('On — not applied'));
+        patch.deferApply = true;
+        await sleep(450);
+        byName.wocEnable.emit('action');
+        await until('deferred option', () => status.text === 'Patch pending — reboot to activate' &&
+            byName.wocNavmd.text.includes('not applied') && byName.wocNavmd.text.includes('reboot needed') &&
+            byName.wocNavmdStatus.text.includes('on disk: On — reboot needed') && !byName.wocNavmd.enabled &&
+            !byName.wocEnable.visible && byName.wocRestart.visible);
+        patch.deferApply = false;
+        patch.pending = null; patch.carplay = null; patch.state = 'patched';
+        patch._broadcast(patch._status());
+        await until('post reboot confirmed', () => byName.wocNavmd.text === 'Suppress native guidance: On' &&
+            !byName.wocEnable.visible);
+        patch.navmd = null;
+        patch._broadcast(patch._status());
+        console.log('ok   pre-option, on/off apply, unavailable/unknown and old daemon');
 
         byName.ST_OnlineApps_WazeCluster.emit('visible', { visible: false });
         await until('sockets closed', () => render._clients.size === 0 && patch._clients.size === 0);

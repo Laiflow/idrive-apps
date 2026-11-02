@@ -46,9 +46,10 @@
  *            `substring/regex`) must be proven per build (PATCH.md, Edit 5):
  *            locate refuses unless the string is unique, used by one function
  *            off the video path, with exactly one caller. Off unless asked;
- *            it never gates patchability, and status/probe report it only
- *            with an anchor (`--navmd`, or WOC_NAVMD_ANCHOR in the
- *            environment, which revert and verify also honor).
+ *            it never gates core-only patchability. An explicit flag or
+ *            WOC_NAVMD_ANCHOR requests the edit; validated backup metadata
+ *            lets status/probe/verify/revert find it without a new request.
+ *            Legacy backups without that identity require an explicit anchor.
  *
  * The sites are found in each build by carplay_locate.js; a build where any
  * of them is not found, or reads as neither stock nor this patch, is refused.
@@ -60,7 +61,7 @@
  *
  *   carplay_patch.js status [--target <file>] [--navmd <anchor>]
  *   carplay_patch.js probe  [<file>] [--navmd <anchor>]
- *   carplay_patch.js apply  --panel high|mid [--sink <url> | --capture <fifo>] [--res WxH|stock] [--safe WxH+X+Y|full] [--navmd <anchor>] [--target <file>] [--unproven] [--yes]
+ *   carplay_patch.js apply  --panel high|mid [--sink <url> | --capture <fifo>] [--res WxH|stock] [--safe WxH+X+Y|full] [--navmd <anchor>] [--navmd-on | --navmd-off] [--target <file>] [--unproven] [--yes]
  *   carplay_patch.js revert [--target <file>] [--navmd <anchor>] [--yes] [--drop-backup]
  *   carplay_patch.js verify [--target <file>] [--navmd <anchor>]
  *
@@ -254,7 +255,7 @@ function cmdStatus(target, anchor) {
     var bak = backupPath(target), hasBak = fs.existsSync(bak), bakWhy = '';
     if (hasBak && !bad.length) {
         var b;
-        try { b = checkedBackup(target, p.bc ? { buf: p.b.buf, c: p.bc } : null); } catch (e) { b = { err: e.message }; }
+        try { b = checkedBackup(target, p.bc ? { buf: p.b.buf, c: p.bc } : null, anchor); } catch (e) { b = { err: e.message }; }
         bakWhy = b.err ? 'backup ' + bak + ' is not a pristine original'
             : !sameBuild(c, b.c) ? 'backup ' + bak + ' is the original of another carplay build' : '';
     }
@@ -345,8 +346,135 @@ function checkedBackup(target, pre, anchor) {
     var orig = pre ? pre.buf : fs.readFileSync(backupPath(target)), hash = sha256(orig), meta = null;
     try { meta = JSON.parse(fs.readFileSync(metaPath(target), 'utf8')); } catch (e) {}
     if (meta && meta.sha256_original && meta.sha256_original !== hash) return { err: 'sha256 ' + hash + ' != recorded ' + meta.sha256_original };
+    if (meta && meta.buildId && meta.buildId !== locator.buildId(orig)) return { err: 'build-id does not match recorded original' };
     var c = pre ? pre.c : classify(orig, anchor), why = notPristine(c, orig);
     return why ? { err: why } : { buf: orig, hash: hash, c: c };
+}
+
+/* Persist enough original-image evidence to validate a recorded edit even
+ * after locator policy tightens. This proves identity, not eligibility for a
+ * NEW optional edit: a historical record can only authorize full recovery. */
+var NAVMD_RECOVERY_ONLY = false;
+function imageAddress(buf, off) {
+    var phoff = buf.readUInt32LE(32) + buf.readUInt32LE(36) * 4294967296;
+    var entsize = buf.readUInt16LE(54), count = buf.readUInt16LE(56);
+    for (var i = 0; i < count; i++) {
+        var p = phoff + i * entsize;
+        if (p + 56 > buf.length) return null;
+        if (buf.readUInt32LE(p) !== 1) continue;
+        var start = buf.readUInt32LE(p + 8) + buf.readUInt32LE(p + 12) * 4294967296;
+        var size = buf.readUInt32LE(p + 32) + buf.readUInt32LE(p + 36) * 4294967296;
+        if (off >= start && off < start + size)
+            return buf.readUInt32LE(p + 16) + buf.readUInt32LE(p + 20) * 4294967296 + off - start;
+    }
+    return null;
+}
+function anchorMatches(name, anchor) {
+    var sep = anchor.indexOf('/'), key = sep < 0 ? anchor : anchor.slice(0, sep);
+    if (name.indexOf(key) < 0) return false;
+    return sep < 0 || new RegExp(anchor.slice(sep + 1)).test(name);
+}
+function navmdProof(orig, n, anchor) {
+    var text = orig.toString('latin1'), names = /(?:^|\x00)(void (?:[A-Za-z_]\w*::)+[A-Za-z_]\w*\([^()\x00]*\))(?=\x00)/g;
+    var match, found = [];
+    while ((match = names.exec(text)) !== null) {
+        if (anchorMatches(match[1], anchor))
+            found.push({ name: match[1], at: match.index + (match[0].charCodeAt(0) === 0 ? 1 : 0) });
+    }
+    if (found.length !== 1) throw new Error('cannot record navmd: ambiguous self-name evidence');
+    var name = found[0], load = -1;
+    for (var i = n.forwarder; i + 7 <= n.ret; i++) {
+        if ((orig[i] === 0x48 || orig[i] === 0x4c) && orig[i + 1] === 0x8d && (orig[i + 2] & 0xc7) === 5 &&
+            imageAddress(orig, i + 7) + orig.readInt32LE(i + 3) === imageAddress(orig, name.at)) { load = i; break; }
+    }
+    if (load < 0) throw new Error('cannot record navmd: missing self-name load evidence');
+    return { forwarder: n.forwarder, ret: n.ret, name: name.name, nameOffset: name.at, nameLoad: load };
+}
+function validNavmdProof(orig, n) {
+    var p = n.proof;
+    if (!p || !['forwarder', 'ret', 'nameOffset', 'nameLoad'].every(function (k) {
+        return Number.isInteger(p[k]) && p[k] >= 0 && p[k] < orig.length;
+    }) || typeof p.name !== 'string' || !/^void (?:[A-Za-z_]\w*::)+[A-Za-z_]\w*\([^()\x00]*\)$/.test(p.name) ||
+        p.ret <= p.forwarder || p.nameLoad < p.forwarder || p.nameLoad + 7 > p.ret ||
+        orig[p.ret] !== 0xc3 || p.nameOffset + Buffer.byteLength(p.name, 'latin1') >= orig.length ||
+        orig.toString('latin1', p.nameOffset, p.nameOffset + p.name.length + 1) !== p.name + '\0' ||
+        !anchorMatches(p.name, n.anchor)) return false;
+    var next = imageAddress(orig, n.offset + 5), entry = imageAddress(orig, p.forwarder), ret = imageAddress(orig, p.ret);
+    if (next === null || entry === null || ret === null ||
+        next + Buffer.from(n.original, 'hex').readInt32LE(1) !== entry ||
+        next + Buffer.from(n.patched, 'hex').readInt32LE(1) !== ret) return false;
+    var load = p.nameLoad;
+    if (!((orig[load] === 0x48 || orig[load] === 0x4c) && orig[load + 1] === 0x8d && (orig[load + 2] & 0xc7) === 5 &&
+        imageAddress(orig, load + 7) + orig.readInt32LE(load + 3) === imageAddress(orig, p.nameOffset))) return false;
+    var expected = navmdProof(orig, p, n.anchor);
+    return expected.name === p.name && expected.nameOffset === p.nameOffset && expected.nameLoad === p.nameLoad;
+}
+
+/* A persisted optional edit is recovery authority, not a new apply request.
+ * Legacy backups have no identity: use an explicit anchor, never guess a call.
+ * Validate the record against the verified original and locator before using
+ * its anchor for classification or letting revert discard the backup. */
+function recordedNavmd(target) {
+    var meta;
+    try { meta = JSON.parse(fs.readFileSync(metaPath(target), 'utf8')); }
+    catch (e) {
+        if (e.code === 'ENOENT') return null;
+        throw new Error('invalid backup metadata: ' + e.message);
+    }
+    if (!meta || !Object.prototype.hasOwnProperty.call(meta, 'navmd')) return null;
+    var n = meta.navmd;
+    if (!n || n.schema !== 1 || typeof n.anchor !== 'string' || !n.anchor.trim() ||
+        !Number.isInteger(n.offset) || n.offset < 0 ||
+        typeof n.original !== 'string' || !/^e8[0-9a-f]{8}$/.test(n.original) ||
+        typeof n.patched !== 'string' || !/^e8[0-9a-f]{8}$/.test(n.patched) ||
+        typeof n.sha256_original !== 'string' || !/^[0-9a-f]{64}$/.test(n.sha256_original) ||
+        !Object.prototype.hasOwnProperty.call(n, 'buildId'))
+        throw new Error('invalid persisted navmd identity');
+    var orig = fs.readFileSync(backupPath(target)), hash = sha256(orig);
+    if (meta.sha256_original !== hash || n.sha256_original !== hash ||
+        meta.buildId !== locator.buildId(orig) || n.buildId !== meta.buildId)
+        throw new Error('persisted navmd identity does not match backup hash/build');
+    if (n.offset + 5 > orig.length || orig.toString('hex', n.offset, n.offset + 5) !== n.original ||
+        (n.proof && !validNavmdProof(orig, n)))
+        throw new Error('persisted navmd identity does not match backup site/bytes');
+    /* Runtime policy is derived from this locator result, never metadata. */
+    delete n.recoveryOnly;
+    var bc = classify(orig, n.anchor), site = bc.loc.navmd;
+    if (site && site.ok) {
+        if (bc.navmd.state !== 'original' || site.offset !== n.offset || site.original !== n.original || site.patched !== n.patched)
+            throw new Error('persisted navmd identity does not match backup site/bytes');
+    } else {
+        if (!validNavmdProof(orig, n)) throw new Error('persisted navmd identity lacks validated historical recovery evidence');
+        n.recoveryOnly = true;
+    }
+    return n;
+}
+
+/* Write a complete record atomically, only after rechecking the backup. This
+ * also repairs a legacy backup when an explicitly anchored apply is a no-op.
+ * The record reaches disk before the optional target edit can reach disk. */
+function persistNavmd(target, anchor, c) {
+    var b = checkedBackup(target, null, anchor);
+    if (b.err || !sameBuild(c, b.c)) throw new Error('cannot record navmd: backup is not this pristine build');
+    var site = b.c.loc.navmd;
+    if (!site || !site.ok || b.c.navmd.state !== 'original') throw new Error('cannot record navmd: unvalidated backup site');
+    var meta;
+    try { meta = JSON.parse(fs.readFileSync(metaPath(target), 'utf8')); }
+    catch (e) {
+        if (e.code !== 'ENOENT') throw e;
+        meta = { target: path.resolve(target), version: label(b.c), savedAt: new Date().toISOString() };
+    }
+    meta.sha256_original = b.hash;
+    meta.buildId = b.c.loc.buildId;
+    meta.navmd = { schema: 1, anchor: anchor, offset: site.offset, original: site.original,
+        patched: site.patched, sha256_original: b.hash, buildId: b.c.loc.buildId, proof: navmdProof(b.buf, site, anchor) };
+    var tmp = metaPath(target) + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(meta, null, 2) + '\n', { mode: 0o600 });
+    fsyncFile(tmp);
+    fs.renameSync(tmp, metaPath(target));
+    var fd = fs.openSync(path.dirname(metaPath(target)), 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    recordedNavmd(target);   /* validate the committed metadata before any target write */
 }
 
 /* The most bytes a binary may differ in from its backup and still count as
@@ -382,6 +510,85 @@ function trustedBackup(target, cur) {
     return { buf: orig, hash: hash, meta: !!meta, other: otherBuild(cur, orig) };
 }
 
+/* Resolve a file-backed virtual address, rejecting ambiguous LOAD mappings. */
+function imageOffset(buf, va) {
+    var phoff = buf.readUInt32LE(32) + buf.readUInt32LE(36) * 4294967296;
+    var entsize = buf.readUInt16LE(54), count = buf.readUInt16LE(56), found = null;
+    for (var i = 0; i < count; i++) {
+        var p = phoff + i * entsize;
+        if (p + 56 > buf.length) return -2;
+        if (buf.readUInt32LE(p) !== 1) continue;
+        var off = buf.readUInt32LE(p + 8) + buf.readUInt32LE(p + 12) * 4294967296;
+        var base = buf.readUInt32LE(p + 16) + buf.readUInt32LE(p + 20) * 4294967296;
+        var size = buf.readUInt32LE(p + 32) + buf.readUInt32LE(p + 36) * 4294967296;
+        if (va < base || va >= base + size) continue;
+        var at = off + va - base;
+        if (at < 0 || at >= buf.length || (found !== null && found !== at)) return -2;
+        found = at;
+    }
+    return found === null ? -1 : found;
+}
+
+/* Detection only: never authorize a restore or persist an inferred identity.
+ * A possible old call-to-ret is inspected at its own forwarder, not by running
+ * the whole-image locator once per name. Limits are deliberately conservative:
+ * ambiguity means refusal, not a clean result that could permit backup deletion. */
+function legacyNavmdDifference(cur, orig, bc) {
+    if (!bc.ok || !bc.loc.ok || cur.length !== orig.length) return false;
+    var core = regions(bc.loc), changedCalls = 0, candidates = 0, totalBody = 0;
+    var maxChangedCalls = 256, maxCandidates = 32, maxBody = 4096, maxTotalBody = 16384, maxRefs = 64, maxName = 1024;
+    if (orig.readUInt16LE(56) > 128) return true; /* bound LOAD mapping work */
+    for (var i = 0; i + 5 <= orig.length; i++) {
+        if (orig[i] !== 0xe8 || cur[i] !== 0xe8 || orig.readUInt32LE(i + 1) === cur.readUInt32LE(i + 1)) continue;
+        if (core.some(function (r) { return i < r[0] + r[1] && i + 5 > r[0]; })) continue;
+        if (++changedCalls > maxChangedCalls) return true;
+        var next = imageAddress(orig, i + 5);
+        if (next === null) {
+            /* A candidate-shaped call outside a file-backed LOAD cannot be
+             * safely interpreted; retain the previous offset-shaped guard. */
+            var oldEntry = i + 5 + orig.readInt32LE(i + 1), oldRet = i + 5 + cur.readInt32LE(i + 1);
+            if (oldEntry >= 0 && oldRet > oldEntry && oldRet < orig.length && orig[oldRet] === 0xc3 && cur[oldRet] === 0xc3) return true;
+            continue;
+        }
+        var entry = imageOffset(orig, next + orig.readInt32LE(i + 1));
+        var ret = imageOffset(orig, next + cur.readInt32LE(i + 1));
+        if (entry === -2 || ret === -2) return true;
+        if (entry < 0 || ret <= entry || ret >= orig.length || orig[ret] !== 0xc3 || cur[ret] !== 0xc3) continue;
+        totalBody += ret - entry + 1;
+        if (++candidates > maxCandidates || ret - entry > maxBody || totalBody > maxTotalBody) return true;
+        if (!orig.slice(entry, ret + 1).equals(cur.slice(entry, ret + 1))) return true;
+        var refs = 0;
+        for (var p = entry; p + 7 <= ret; p++) {
+            if ((orig[p] !== 0x48 && orig[p] !== 0x4c) || orig[p + 1] !== 0x8d || (orig[p + 2] & 0xc7) !== 5) continue;
+            if (++refs > maxRefs) return true;
+            var loadNext = imageAddress(orig, p + 7);
+            if (loadNext === null) return true;
+            var nameAt = imageOffset(orig, loadNext + orig.readInt32LE(p + 3));
+            if (nameAt === -2) return true;
+            if (nameAt < 0 || (nameAt > 0 && orig[nameAt - 1] !== 0) ||
+                orig.toString('latin1', nameAt, Math.min(nameAt + 5, orig.length)) !== 'void ') continue;
+            var limit = Math.min(orig.length, nameAt + maxName + 1);
+            var end = orig.slice(nameAt, limit).indexOf(0);
+            if (end < 0) return true;
+            var name = orig.toString('latin1', nameAt, nameAt + end);
+            if (!/^void (?:[A-Za-z_]\w*::)+[A-Za-z_]\w*\([^()\x00]*\)$/.test(name)) continue;
+            /* Historical proof remains useful even when current locator policy
+             * rejects the old site. Failure/ambiguous names still refuse: this
+             * is only a detection query, not permission to restore. */
+            if (name.indexOf('/') < 0) {
+                var historical = { offset: i, anchor: name,
+                    original: orig.toString('hex', i, i + 5), patched: cur.toString('hex', i, i + 5) };
+                try {
+                    historical.proof = navmdProof(orig, { forwarder: entry, ret: ret }, name);
+                    if (validNavmdProof(orig, historical)) return true;
+                } catch (e) { /* ambiguous historical evidence: refuse below */ }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 /* What a revert of `cur` (classified as `c`) writes, without --force:
  * { b, bc (the backup classified), regionWise, out } or { err }. When the
  * locator recognises the target and the backup as the same build, the
@@ -389,10 +596,19 @@ function trustedBackup(target, cur) {
  * otherwise the whole backup. A backup with no record of the original (an
  * older release's, cut short by a power loss) is written whole only when the
  * locator reads it as the pristine build or it has the target's size. */
-function restorePlan(target, cur, c, anchor) {
+function restorePlan(target, cur, c, anchor, force) {
     var b = trustedBackup(target, cur);
     if (b.err) return b;
     var orig = b.buf, bc = classify(orig, anchor), pristine = !notPristine(bc, orig);
+    if (!b.meta && !pristine && orig.length !== cur.length)
+        return { err: 'no record of the original, and it is not the pristine build' };
+    /* Explicit force knowingly discards other modifications, but never skips
+     * trustedBackup's integrity checks or record-less backup size safeguards. */
+    if (force || NAVMD_RECOVERY_ONLY) return { b: b, bc: bc, regionWise: false, out: orig };
+    if (anchor !== undefined && (!bc.navmd || bc.navmd.state !== 'original'))
+        return { err: 'navmd anchor does not identify a validated original backup call' };
+    if (anchor === undefined && !b.other && legacyNavmdDifference(cur, orig, bc))
+        return { err: 'legacy navmd needs --navmd <proven anchor>; refusing an unanchored restore or backup deletion' };
     if (!b.other && !unrecognised(c).length && pristine && sameBuild(c, bc)) {
         var out = Buffer.from(cur);
         regions(c.loc).forEach(function (r) { orig.copy(out, r[0], r[0], r[0] + r[1]); });
@@ -402,7 +618,7 @@ function restorePlan(target, cur, c, anchor) {
     return { b: b, bc: bc, regionWise: false, out: orig };
 }
 
-function cmdApply(target, panel, capture, sink, res, safe, yes, unproven, anchor) {
+function cmdApply(target, panel, capture, sink, res, safe, yes, unproven, anchor, requestedAnchor, navmdOff, navmdOn) {
     if (panel !== 'high' && panel !== 'mid') die('--panel must be high or mid');
     var wantRes = resFor(panel, res, safe);
     var sinkUrl = sinkUrlFor(capture, sink), slotLen = locator.SINK_STOCK.length;
@@ -410,16 +626,24 @@ function cmdApply(target, panel, capture, sink, res, safe, yes, unproven, anchor
         die('sink URL too long: "' + sinkUrl + '" is ' + Buffer.byteLength(sinkUrl, 'latin1') + ' bytes, slot holds ' + slotLen);
 
     var buf = readTarget(target), c = classify(buf, anchor), bad = unrecognised(c);
-    if (c.loc.navmd && !c.loc.navmd.ok) bad.push(c.loc.navmd.reason);
+    if (c.navmd && c.navmd.state === 'unknown') bad.push(c.navmd.reason);
     if (bad.length) die('refusing: ' + bad.join('; '));
 
     /* Back up the pristine original before the first edit; require that a
      * pre-existing backup is the pristine original of this build. */
     var bak = backupPath(target), orig = buf;
     if (!fs.existsSync(bak)) {
+        /* Without an anchor or backup, only a byte-exact shipped image can
+         * prove navmd is off. Never infer an optional site by scanning names. */
+        if (navmdOff && anchor === undefined) {
+            var shipped = PROVEN[c.loc.buildId];
+            if (!shipped || sha256(buf) !== shipped.sha256)
+                die('unanchored navmd off requires a verified --navmd <anchor> or a verified backup; image is not an exact proven build');
+        }
         var why = notPristine(c, buf);
         if (why) die('first edit requires the pristine build: ' + why);
         if (!PROVEN[c.loc.buildId] && !unproven) die(label(c) + ' (carplay ' + (c.loc.version || 'version unknown') + ') is not a proven build; pass --unproven to patch it anyway');
+        if ((navmdOn || navmdOff) && !yes) die('pass --yes to proceed');
         /* The backup is written and checked under a temporary name, its record
          * written in full and renamed into place, then the backup renamed: a
          * backup never exists without its record. */
@@ -438,6 +662,10 @@ function cmdApply(target, panel, capture, sink, res, safe, yes, unproven, anchor
         if (b.err) die('existing backup ' + bak + ' is not a pristine original (' + b.err + '); refusing');
         if (!sameBuild(c, b.c)) die('existing backup ' + bak + ' is the original of another build; refusing');
         orig = b.buf;
+        /* An unanchored off must not silently strand a legacy optional edit.
+         * Detection is deliberately not sufficient to authorize restoration. */
+        if (navmdOff && anchor === undefined && legacyNavmdDifference(buf, orig, b.c))
+            die('legacy navmd needs --navmd <proven anchor>; refusing unanchored off');
     }
 
     var loc = c.loc, out = Buffer.from(buf), changed = [];
@@ -473,13 +701,20 @@ function cmdApply(target, panel, capture, sink, res, safe, yes, unproven, anchor
         put(resText, o, (wantRes ? resWant : orig).slice(o, o + 8));
     });
 
-    /* The optional navmd edit, only when an anchor was given: the forward call
+    /* The optional navmd edit, only when requested (not merely recorded): the forward call
      * is retargeted to the forwarder's terminating ret, so guidance metadata
      * never reaches the HMI. The video-path isolation was checked at locate
      * time (PATCH.md, Edit 5). */
-    if (anchor !== undefined) put('navmd -> dropped', loc.navmd.offset, Buffer.from(loc.navmd.patched, 'hex'));
+    if (navmdOff && anchor !== undefined) put('navmd -> original', loc.navmd.offset, orig.slice(loc.navmd.offset, loc.navmd.offset + 5));
+    else if (requestedAnchor !== undefined) put('navmd -> dropped', loc.navmd.offset, Buffer.from(loc.navmd.patched, 'hex'));
 
-    if (changed.length === 0) { process.stdout.write('nothing to do; already in the requested state\n'); return; }
+    if (changed.length === 0) {
+        if (requestedAnchor !== undefined) {
+            if (!yes) die('pass --yes to record navmd recovery identity');
+            persistNavmd(target, anchor, c);
+        }
+        process.stdout.write('nothing to do; already in the requested state\n'); return;
+    }
 
     /* The edited image must read as exactly the requested state, at the same
      * sites, changed only in the edit regions, before it is written. */
@@ -488,7 +723,8 @@ function cmdApply(target, panel, capture, sink, res, safe, yes, unproven, anchor
         : cc.sink.state !== (sinkUrl !== undefined ? 'redirected' : 'original') ? 'sink'
         : cc.selfstart.state !== 'patched' ? 'self-start'
         : cc.res.state !== (wantRes ? 'patched' : 'original') ? 'resolution'
-        : (anchor !== undefined && (!cc.loc.navmd || !cc.loc.navmd.ok || cc.navmd.state !== 'patched')) ? 'navmd'
+        : (navmdOff && anchor !== undefined && (!cc.loc.navmd || !cc.loc.navmd.ok || cc.navmd.state !== 'original')) ? 'navmd'
+        : (requestedAnchor !== undefined && (!cc.loc.navmd || !cc.loc.navmd.ok || cc.navmd.state !== 'patched')) ? 'navmd'
         : !onlyRegionsDiffer(buf, out, regions(loc)) ? 'bytes outside the edit regions' : null;
     if (wrong) die('refusing: the edited binary does not verify (' + wrong + '); no change made');
 
@@ -496,6 +732,7 @@ function cmdApply(target, panel, capture, sink, res, safe, yes, unproven, anchor
     changed.forEach(function (x) { process.stdout.write('  ' + x + '\n'); });
     if (!yes) die('pass --yes to proceed');
 
+    if (requestedAnchor !== undefined) persistNavmd(target, anchor, c);
     writeInPlace(target, out);
     var after = readTarget(target);
     if (!after.equals(out)) die('post-write verification failed: ' + target + ' does not hold the edited bytes; restore from ' + bak);
@@ -521,7 +758,7 @@ function cmdRevert(target, yes, force, dropBackup, anchor) {
     var bak = backupPath(target);
     if (!fs.existsSync(bak)) die('no backup at ' + bak + '; cannot revert');
     var cur = readTarget(target), p;
-    try { p = restorePlan(target, cur, classify(cur, anchor), anchor); } catch (e) { p = { err: e.message }; }
+    try { p = restorePlan(target, cur, classify(cur, anchor), anchor, force); } catch (e) { p = { err: e.message }; }
     if (p.err) die('backup ' + bak + ' is not a verified original (' + p.err + '); refusing to restore it');
     var b = p.b, orig = b.buf;
     if (cur.equals(orig)) { process.stdout.write('already at the original; nothing to do\n'); drop(); return; }
@@ -548,7 +785,7 @@ function cmdRevert(target, yes, force, dropBackup, anchor) {
 
 function cmdVerify(target, anchor) {
     var c = classify(readTarget(target), anchor), bad = unrecognised(c);
-    if (anchor !== undefined && c.ok && c.loc.navmd && !c.loc.navmd.ok) bad.push(c.loc.navmd.reason);
+    if (c.navmd && c.navmd.state === 'unknown') bad.push(c.navmd.reason);
     if (bad.length) { process.stderr.write('FAIL: ' + bad.join('; ') + '\n'); process.exit(1); }
     /* A fully enabled build has every edit its panel needs. A variant/
      * sink-patched build with stock self-start (an Edit-1/2-only binary)
@@ -607,6 +844,8 @@ function parseArgs(argv) {
         else if (t === '--force') a.force = true;
         else if (t === '--drop-backup') a.dropBackup = true;
         else if (t === '--unproven') a.unproven = true;
+        else if (t === '--navmd-on') a.navmdOn = true;
+        else if (t === '--navmd-off') a.navmdOff = true;
         else if (t === '--target') a.target = argv[++i];
         else if (t === '--panel') a.panel = argv[++i];
         else if (t === '--capture') {
@@ -629,16 +868,55 @@ function main() {
     var a = parseArgs(process.argv.slice(2));
     var cmd = a._[0];
     var target = a.target || '/usr/bin/carplay';
-    /* The optional navmd edit's anchor: --navmd <anchor>, or, when the flag
-     * carries no value, WOC_NAVMD_ANCHOR in the environment. */
-    var anchor;
-    if (a.navmd !== undefined) anchor = a.navmd || process.env.WOC_NAVMD_ANCHOR || '';
+    if (a.navmdOn && a.navmdOff) die('--navmd-on and --navmd-off conflict');
+    if ((a.navmdOn || a.navmdOff) && cmd !== 'apply') die('--navmd-on and --navmd-off are apply-only');
+    /* Bare --navmd uses the environment; an explicit empty value refuses.
+     * Omission uses a nonempty environment anchor as an opt-in request.
+     * A recorded anchor is classification/recovery context only. */
+    var requestedAnchor = a.navmd === null ? (a.navmdOff ? '' : process.env.WOC_NAVMD_ANCHOR || '')
+        : a.navmd !== undefined ? a.navmd : a.navmdOff ? undefined : process.env.WOC_NAVMD_ANCHOR || undefined;
+    if (requestedAnchor !== undefined && (typeof requestedAnchor !== 'string' || !requestedAnchor.trim()))
+        die('--navmd needs a non-empty anchor');
+    if (cmd === 'probe') target = a.target || a._[1] || '/usr/bin/carplay';
+    var anchor = requestedAnchor;
+    try {
+        var record = recordedNavmd(target);
+        if (record) {
+            if (requestedAnchor !== undefined && requestedAnchor !== record.anchor) {
+                var requestedSite = locator.locate(fs.readFileSync(backupPath(target)), requestedAnchor).navmd;
+                if (!requestedSite || !requestedSite.ok || requestedSite.offset !== record.offset ||
+                    requestedSite.original !== record.original || requestedSite.patched !== record.patched)
+                    throw new Error('requested navmd anchor conflicts with persisted identity');
+            }
+            anchor = record.anchor;
+            NAVMD_RECOVERY_ONLY = !!record.recoveryOnly;
+        }
+    } catch (e) {
+        if (cmd === 'status' || cmd === 'probe') {
+            header(target, readTarget(target), classify(readTarget(target)));
+            line(cmd === 'status' ? 'restorable' : 'patchable', 'no (' + e.message + ')');
+            line('known', 'NO — ' + e.message);
+            line('navmd', 'UNKNOWN (' + e.message + ')');
+            return;
+        }
+        die('backup is not a verified original (' + e.message + '); refusing');
+    }
+    if (a.navmdOn && requestedAnchor === undefined) {
+        if (!record) die('--navmd-on needs a non-empty configured or recorded anchor');
+        requestedAnchor = record.anchor;
+    }
+    if (NAVMD_RECOVERY_ONLY && (cmd === 'verify' || (cmd === 'apply' && (requestedAnchor !== undefined || a.navmdOff))))
+        die('recorded navmd no longer meets locator policy; use revert to recover the trusted full original before requesting navmd again');
+    /* A core-only reapply still changes only its four regions. Preserve the
+     * historical optional bytes without claiming the current locator proves
+     * their eligibility for a new navmd request. */
+    if (NAVMD_RECOVERY_ONLY && cmd === 'apply') anchor = undefined;
     if (cmd === 'status') cmdStatus(target, anchor);
-    else if (cmd === 'probe') cmdProbe(a.target || a._[1] || '/usr/bin/carplay', anchor);
-    else if (cmd === 'apply') cmdApply(target, a.panel, a.capture, a.sink, a.res, a.safe, a.yes, a.unproven, anchor);
+    else if (cmd === 'probe') cmdProbe(target, anchor);
+    else if (cmd === 'apply') cmdApply(target, a.panel, a.capture, a.sink, a.res, a.safe, a.yes, a.unproven, anchor, a.navmdOff ? undefined : requestedAnchor, a.navmdOff, a.navmdOn);
     else if (cmd === 'revert') cmdRevert(target, a.yes, a.force, a.dropBackup, anchor);
     else if (cmd === 'verify') cmdVerify(target, anchor);
-    else { process.stderr.write('usage: carplay_patch.js status|probe|apply|revert|verify [--target <file>] [--panel high|mid] [--capture <fifo> | --sink <url>] [--res WxH|stock] [--safe WxH+X+Y|full] [--navmd <anchor>] [--unproven] [--yes] [--force] [--drop-backup]\n'); process.exit(2); }
+    else { process.stderr.write('usage: carplay_patch.js status|probe|apply|revert|verify [--target <file>] [--panel high|mid] [--capture <fifo> | --sink <url>] [--res WxH|stock] [--safe WxH+X+Y|full] [--navmd <anchor>] [--navmd-on | --navmd-off] [--unproven] [--yes] [--force] [--drop-backup]\n'); process.exit(2); }
 }
 
 main();

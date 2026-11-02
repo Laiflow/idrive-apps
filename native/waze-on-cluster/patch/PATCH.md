@@ -281,28 +281,105 @@ guidance metadata, but Apple Maps, AutoNavi and Google Maps do, so banner and
 map overlap on the cluster glass.
 
 The edit is one rel32: CarPlay's guidance-metadata forward call is retargeted
-to the forwarder's own terminating `ret`. A call into a bare ret pushes and
-pops the same return address — no register, flag or net stack effect — so the
-metadata stops at the forwarder while the caller continues unchanged, and
-nothing new can throw (compare Edit 3's exception analysis). The patched site
-is still a `call` pointed at the forwarder's last byte, so the patched state
-locates and reads back to the stock rel32 (a plain nop would destroy the
-site's identity).
+to a verified `ret` in the forwarder. The replacement itself has no net stack
+effect, but that alone does not prove that skipping a function is safe. The
+forwarder's own name must establish a `void` return contract; a non-void
+forwarder is refused because its caller could consume the missing result.
+The call instruction remains recognizable in its patched state so the
+original rel32 can be restored.
 
-**Opt-in, never gating.** The forwarder has no proven name string yet; the
-anchor must be proven per build on the unit. So `apply` writes the edit only
-with `--navmd <anchor>` (or `WOC_NAVMD_ANCHOR`), a build without a resolvable
-anchor patches exactly as before, and status/probe/verify/revert see the edit
-only with an anchor too. `locate` refuses a wrong guess before any write:
+**Opt-in, never a required edit.** The forwarder has no proven name string yet;
+the anchor must be proven per build on the unit. `apply` requests the edit only
+with `--navmd <anchor>` or a nonempty `WOC_NAVMD_ANCHOR`. An explicit flag takes
+precedence; a bare `--navmd` uses the environment, and an empty request is
+refused. Without a request the original four edits behave as before, and an
+already-applied navmd edit is preserved rather than newly enabled. A requested
+anchor that cannot be resolved safely is refused before editing the target.
 
-- the anchor (`substring`, or `substring/regex`) must name exactly one
-  string, used by exactly one function;
-- that function must **not be, call, or be called from the video-path trio**
-  (setStreamStatus / requestStream / onSuggestUi) — the runtime guard for the
-  one unverified assumption, that metadata and video are separate channels;
-- exactly one caller in the whole image, and the forwarder must end in `ret`
-  (found past the tail padding);
-- no dynamic relocation over the call site.
+The optional locator uses conservative instruction-boundary validation; it
+refuses unsupported encodings instead of treating operand bytes as instructions.
+Its checks include:
+
+- the anchor (`substring`, or `substring/regex`) must have a nonempty
+  substring key and name exactly one string, used by exactly one function,
+  with an explicit `void` return type;
+- that function must **not be, call, or tail-jump to the video-path trio**
+  (setStreamStatus / requestStream / onSuggestUi), and direct tail invocations
+  of the forwarder are refused too;
+- exactly one accepted call site, on a verified instruction boundary, and a
+  decoded return destination rather than a `C3` byte in a trailing literal;
+- no dynamic relocation over the call site or its replacement return target.
+
+The supported instruction and caller-suffix set is deliberately narrow: a
+real forwarding function with unsupported instructions or an unproven return
+contract is refused, not automatically patched. Passing a `void` name alone
+is not enough; the caller and forwarder must also meet the return-state checks.
+
+These are structural checks, not proof that the anchor really handles guidance
+metadata or that all indirect/transitive dependencies are absent. DLT recon and
+on-car validation remain necessary; `--unproven` does not bypass these checks.
+
+**HMI pre-option.** The application offers a “Suppress native guidance”
+On/Off choice ahead of Enable map / Apply settings. The choice is initially
+Off and changing it only stages the setting; no file is written until the user
+presses Enable map / Apply settings. On applies the optional edit along with
+the selected map settings. Off restores only navmd while keeping the map
+patch enabled. Disable map reverts all of this tool's edits. If a written
+change is deferred, the page shows that a head-unit restart is needed; the
+switch does not promise an immediate running-process change.
+
+The switch is unavailable until a per-build anchor has been verified and
+provisioned for the root patch daemon. There is **no proven production anchor
+in this release**: installing the app or setting a candidate does not prove one.
+After DLT and on-car validation, an administrator can provision the anchor as a
+single UTF-8 line in `/var/opt/waze-on-cluster/navmd-anchor`, owned by root,
+not writable by group or others. The daemon accepts only a regular file opened
+without following symlinks; an invalid file or a build the locator refuses is
+reported as unavailable. `WOC_NAVMD_ANCHOR` in the daemon's own environment is
+an alternative for managed deployment. An anchor supplied over the unprivileged
+application socket is never accepted. Merely configuring an anchor does not
+turn the optional edit on; the user must select On and apply settings. The
+daemon can reuse an already-validated saved identity when the anchor file is
+later removed. Existing/older daemons without this protocol leave the option
+unavailable rather than applying it silently.
+
+**CLI apply and restore.** For an extracted test copy, keeping the existing
+panel/sink/geometry options as appropriate:
+
+```sh
+# Set TARGET to an extracted copy, ANCHOR to a per-build verified name.
+node carplay_patch.js probe --target "$TARGET" --navmd "$ANCHOR"
+node carplay_patch.js apply --target "$TARGET" --panel high --navmd "$ANCHOR" --yes
+node carplay_patch.js status --target "$TARGET"
+node carplay_patch.js verify --target "$TARGET"
+node carplay_patch.js revert --target "$TARGET" --yes
+```
+
+For explicitly changing the optional choice while retaining the requested map
+configuration, `apply --navmd-on` enables it using a configured or saved anchor,
+and `apply --navmd-off` restores that edit only. With neither flag an ordinary
+reapply preserves its present state. `revert` / Disable map remains the full
+restore of this tool's edits.
+
+The first edit of a build outside the proven list also requires `--unproven`.
+Apply still manages the original four edits; this is not a navmd-only command.
+Omitting `--sink` selects stock AVB, so carry existing options when reapplying.
+
+New applications save the validated navmd identity alongside the original
+backup. Status/probe/verify and ordinary revert can then recognize it without
+re-entering the anchor. Disable map, uninstall and boot recovery use this same
+anchorless restore path. Region-wise restore includes navmd and keeps unrelated
+changes; keep the backup until restoration is verified. Backups created by an
+older patcher do not have that identity: supply the original `--navmd <anchor>`
+for verification and recovery, or reapply with that anchor to record it before
+using automatic removal. Ordinary recovery refuses a recognizable unrecorded
+navmd change instead of leaving it behind and discarding the backup. This
+legacy detection is conservative, not exhaustive: without a recorded identity,
+continue supplying the original anchor rather than relying on discovery. If a
+historical anchor no longer meets the safety policy, explicit `revert --force`
+can restore the integrity-checked full backup; unlike region-wise restore, it
+discards other modifications too. Use it only after confirming that backup is
+the intended original. Do not delete a legacy backup while navmd remains.
 
 **Proving the anchor on the car.** Record a DLT capture (`patchd`
 `capture-start`) while Apple Maps or AutoNavi navigates, and one with Waze;

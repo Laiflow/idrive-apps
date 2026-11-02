@@ -99,6 +99,7 @@ test('Enable map applies the patch; patched line once done', async (render, patc
     await until('original', () => c.statusText() === 'Original — enable the map');
     c.enableMap();
     await until('applying', () => c.statusText() === 'Applying patch…');
+    await until('apply received', () => patch.count('apply') === 1);
     assert.deepStrictEqual(patch.received.filter((m) => m.cmd === 'apply'), [{ cmd: 'apply', panel: 'high', mode: 'avb' }]);
     await until('patched', () => c.statusText() === 'Patched — waiting for CarPlay');
     c.close();
@@ -185,6 +186,7 @@ test('Disable map reverts', async (render, patch) => {
     await until('patched', () => c.statusText().indexOf('Patched') === 0);
     c.disableMap();
     await until('reverting', () => c.statusText() === 'Reverting patch…');
+    await until('revert received', () => patch.count('revert') === 1);
     assert.strictEqual(patch.count('revert'), 1);
     await until('original', () => c.statusText() === 'Original — enable the map');
     c.close();
@@ -412,6 +414,217 @@ test('reconnect does not duplicate the backlog', async (render, patch) => {
     const after = c.rows().filter((r) => r === 'patch: boot line').length;
     assert.strictEqual(after, 1, 'the resent backlog is not duplicated');
     c.close();
+});
+
+/* A deterministic status stream lets us inject stale, failed and deferred
+ * broadcasts in the same order a real socket can deliver them. */
+function navControl(state, nav) {
+    const c = control();
+    const sent = [];
+    c.patch.link = 'up';
+    c.patch.send = (msg) => sent.push(msg);
+    c._onPatch({ ev: 'status', state: state, navmd: nav });
+    return { c, sent };
+}
+function navStatus(c, state, nav, extra) {
+    c._onPatch(Object.assign({ ev: 'status', state: state, navmd: nav }, extra || {}));
+}
+
+test('navmd is a local pre-option; apply true then apply false without reverting map', () => {
+    const t = navControl('patched', {state:'off'}), c = t.c;
+    assert.strictEqual(c.navmdText(), 'Suppress native guidance: Off');
+    assert(!c.canEnable());
+    c.toggleNavmd();
+    assert.strictEqual(c.navmdStatusText(), 'Guidance on disk: Off');
+    assert.strictEqual(t.sent.length, 0);
+    assert(c.navmdText().includes('On') && c.navmdText().includes('not applied'));
+    assert(c.canEnable());
+    assert.strictEqual(c.enableButtonText(), 'Apply settings');
+    c.enableMap();
+    assert.deepStrictEqual(t.sent[0], {cmd:'apply',panel:'high',mode:'avb',navmd:true});
+    assert(!c.canEnable() && !c.canDisable() && !c.canToggleNavmd());
+    assert.strictEqual(c.statusText(), 'Applying patch…');
+    navStatus(c, 'busy', {state:'unknown',reason:'patch operation in progress'});
+    assert(c.navmdText().includes('On — not applied'));
+    assert(c.navmdStatusText().includes('patch operation in progress'));
+    navStatus(c, 'patched', {state:'on'});
+    assert.strictEqual(c.navmdText(), 'Suppress native guidance: On');
+    assert(!c.canEnable());
+    c.toggleNavmd(); c.enableMap();
+    assert.deepStrictEqual(t.sent[1], {cmd:'apply',panel:'high',mode:'avb',navmd:false});
+    navStatus(c, 'busy', {state:'on'});
+    navStatus(c, 'patched', {state:'off'});
+    assert.strictEqual(c.navmdText(), 'Suppress native guidance: Off');
+    c.disableMap();
+    assert.deepStrictEqual(t.sent[2], {cmd:'revert'});
+});
+
+test('navmd syncs on/off until edited, and stale refresh cannot clear dirty selection', () => {
+    const t = navControl('original', {state:'off'}), c = t.c;
+    navStatus(c, 'original', {state:'on'});
+    assert.strictEqual(c.navmdText(), 'Suppress native guidance: On');
+    navStatus(c, 'original', {state:'off'});
+    c.toggleNavmd();
+    navStatus(c, 'original', {state:'off'});
+    navStatus(c, 'original', {state:'on'});
+    assert(c.navmdText().includes('On — not applied'));
+    c.enableMap();
+    navStatus(c, 'patched', {state:'on'}); // stale matching status before busy
+    assert(c.navmdText().includes('not applied'));
+    navStatus(c, 'busy', {state:'off'});
+    navStatus(c, 'patched', {state:'off'}); // failed to reach requested state
+    assert(c.navmdText().includes('On — not applied'));
+    assert(c.canEnable());
+});
+
+test('unavailable, unknown and old daemons never allow toggling or receive navmd', () => {
+    [undefined, {state:'unavailable',reason:'No root-provisioned verified anchor'},
+        {state:'unknown',reason:'proof failed'}, {state:'future'}].forEach((nav) => {
+        const t = navControl('original', nav), c = t.c;
+        assert(!c.canToggleNavmd());
+        c.toggleNavmd();
+        assert.strictEqual(t.sent.length, 0);
+        assert(c.navmdStatusText().includes(nav && nav.reason || 'daemon does not report this option') || nav && nav.state === 'future');
+        c.enableMap();
+        assert.deepStrictEqual(t.sent[0], {cmd:'apply',panel:'high',mode:'avb'});
+    });
+});
+
+test('dirty selection survives errors, unsupported refresh, and disconnect before busy', () => {
+    const t = navControl('patched', {state:'off'}), c = t.c;
+    c.toggleNavmd(); c.enableMap();
+    navStatus(c, 'error', undefined, {reason:'write failed'});
+    assert.strictEqual(c.statusText(), 'Patch error: write failed');
+    assert(c.navmdText().includes('On — not applied'));
+    assert(c.navmdStatusText().includes('daemon does not report'));
+    navStatus(c, 'patched', {state:'unavailable',reason:'no verified anchor'});
+    assert(!c.canToggleNavmd() && !c.canEnable() && c.navmdText().includes('On — not applied') && c.navmdStatusText().includes('no verified anchor'));
+    navStatus(c, 'patched', {state:'off'});
+    assert(c.navmdText().includes('On — not applied'));
+    c.enableMap();
+    c._patchDisconnected();
+    c.patch.link = 'up';
+    navStatus(c, 'patched', {state:'on'}); // no observed busy: cannot prove completion
+    assert(c.navmdText().includes('On — not applied'));
+    assert(c.canEnable());
+});
+
+test('operation error with verified changed disk syncs a clean choice before the next click', () => {
+    [['off', 'on'], ['on', 'off']].forEach((states) => {
+        const t = navControl('original', {state:states[0]}), c = t.c;
+        c.enableMap(); // unchanged option: no dirty user intent
+        navStatus(c, 'busy', {state:'unknown'});
+        navStatus(c, 'error', {state:states[1]}, {reason:'write failed'});
+        assert.strictEqual(c.statusText(), 'Patch error: write failed');
+        assert.strictEqual(c.navmdText(), 'Suppress native guidance: ' + (states[1] === 'on' ? 'On' : 'Off'));
+        assert.strictEqual(c.navmdStatusText(), 'Guidance on disk: ' + (states[1] === 'on' ? 'On' : 'Off'));
+        assert(c.canToggleNavmd());
+        c.toggleNavmd();
+        assert.strictEqual(c.navmdText(), 'Suppress native guidance: ' + (states[0] === 'on' ? 'On' : 'Off') + ' — not applied');
+        c.enableMap();
+        assert.deepStrictEqual(t.sent[1], {cmd:'apply',panel:'high',mode:'avb',navmd:states[0] === 'on'});
+        c.close();
+    });
+});
+
+test('operation error with verified matching disk does not clear a dirty intent', () => {
+    const c = navControl('original', {state:'off'}).c;
+    c.toggleNavmd(); c.enableMap();
+    navStatus(c, 'busy', {state:'unknown'});
+    navStatus(c, 'error', {state:'on'}, {reason:'write failed'});
+    assert.strictEqual(c.statusText(), 'Patch error: write failed');
+    assert.strictEqual(c.navmdText(), 'Suppress native guidance: On — not applied');
+    assert.strictEqual(c.navmdStatusText(), 'Guidance on disk: On');
+    c.close();
+});
+
+test('deferred navmd is not confirmed until post-reboot authoritative status', () => {
+    const t = navControl('patched', {state:'off'}), c = t.c;
+    c.toggleNavmd(); c.enableMap();
+    navStatus(c, 'busy', {state:'off'});
+    navStatus(c, 'unknown', {state:'on'}, {carplay:'deferred', pending:'apply'});
+    assert.strictEqual(c.statusText(), 'Patch pending — reboot to activate');
+    assert(c.navmdText().includes('not applied') && c.navmdText().includes('reboot needed') && c.navmdStatusText().includes('on disk: On — reboot needed'));
+    assert(!c.canEnable() && !c.canToggleNavmd() && c.restartNeeded());
+    c._patchDisconnected(); c.patch.link = 'up';
+    navStatus(c, 'patched', {state:'on'});
+    assert.strictEqual(c.navmdText(), 'Suppress native guidance: On');
+    assert(!c.canEnable());
+});
+
+test('toggling twice returns to disk state without a spurious apply', () => {
+    ['off', 'on'].forEach((state) => {
+        const t = navControl('patched', {state:state}), c = t.c;
+        c.toggleNavmd();
+        assert(c.canEnable() && c.navmdText().includes('not applied'));
+        c.toggleNavmd();
+        assert(!c.canEnable());
+        assert.strictEqual(c.navmdText(), 'Suppress native guidance: ' + (state === 'on' ? 'On' : 'Off'));
+        assert.strictEqual(t.sent.length, 0);
+    });
+});
+
+test('fresh pending state mirrors disk with reboot warning without overwriting dirty choice', () => {
+    ['on', 'off'].forEach((state) => {
+        const c = navControl('unknown', {state:state}).c;
+        navStatus(c, 'unknown', {state:state}, {pending:'apply', carplay:'deferred'});
+        assert.strictEqual(c.navmdText(), 'Suppress native guidance: ' + (state === 'on' ? 'On' : 'Off') + ' — reboot needed');
+        assert(c.navmdStatusText().includes('reboot needed'));
+        assert(!c.canEnable() && !c.canToggleNavmd());
+    });
+    const c = navControl('patched', {state:'off'}).c;
+    c.toggleNavmd();
+    navStatus(c, 'unknown', {state:'off'}, {pending:'apply', carplay:'deferred'});
+    assert(c.navmdText().includes('On — not applied') && c.navmdText().includes('reboot needed'));
+});
+
+test('missed busy times out, reconnects for fresh status and never confirms dirty choice', async (render, patch) => {
+    patch.state = 'patched'; patch.panel = 'high'; patch.navmd = {state:'off'};
+    const initialConnect = patch._onConnect.bind(patch);
+    let connects = 0;
+    patch._onConnect = (socket) => { if (++connects === 1) initialConnect(socket); };
+    patch._onCommand = (msg) => {
+        patch.received.push(msg);
+        if (msg.cmd === 'apply') {
+            patch.navmd = {state:'on'};
+            patch._broadcast(patch._status()); // terminal event, no busy
+        }
+    };
+    const c = new WazeClusterControl({renderPath:RSOCK, patchPath:PSOCK, pendingPath:PENDING,
+        retryMs:30, operationTimeoutMs:80});
+    try {
+        c.open();
+        await until('initial nav status', () => c.canToggleNavmd());
+        c.toggleNavmd(); c.enableMap();
+        await until('terminal before busy', () => patch.count('apply') === 1 && c.patchStatus && c.patchStatus.navmd.state === 'on');
+        assert(!c.canEnable() && c.navmdText().includes('not applied'));
+        await until('timeout and fresh status request', () => connects >= 2 && patch.count('status') === 1);
+        assert.strictEqual(c.statusText(), 'Operation unconfirmed — refreshing patch status…');
+        assert(!c.canEnable() && !c.canDisable() && !c.canToggleNavmd());
+        assert(c.navmdText().includes('On — not applied'));
+        patch._broadcast(patch._status());
+        await until('fresh status releases lock', () => c.canEnable());
+        assert.strictEqual(c.statusText(), 'Operation unconfirmed — check status before retrying');
+        assert(c.navmdText().includes('On — not applied'));
+        assert.strictEqual(c.navmdStatusText(), 'Guidance on disk: On');
+    } finally { c.close(); }
+});
+
+test('operation timers stop after confirmed success, error, deferred state, and close', () => {
+    const a = navControl('patched', {state:'off'}).c;
+    a.toggleNavmd(); a.enableMap(); assert(a._operationTimer);
+    navStatus(a, 'busy', {state:'unknown'}); navStatus(a, 'patched', {state:'on'});
+    assert.strictEqual(a._operationTimer, null);
+    const b = navControl('patched', {state:'off'}).c;
+    b.toggleNavmd(); b.enableMap(); navStatus(b, 'error', undefined);
+    assert.strictEqual(b._operationTimer, null);
+    const d = navControl('patched', {state:'off'}).c;
+    d.toggleNavmd(); d.enableMap(); navStatus(d, 'busy', {state:'unknown'});
+    navStatus(d, 'unknown', {state:'on'}, {pending:'apply',carplay:'deferred'});
+    assert.strictEqual(d._operationTimer, null);
+    const e = navControl('patched', {state:'off'}).c;
+    e.toggleNavmd(); e.enableMap(); e.close();
+    assert.strictEqual(e._operationTimer, null);
 });
 
 async function main() {

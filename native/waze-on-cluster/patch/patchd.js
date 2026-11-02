@@ -17,12 +17,15 @@
  *
  * Protocol (newline-delimited JSON, one object per line):
  *   app -> patchd  {"cmd":"status"}
- *                  {"cmd":"apply","panel":"high"|"mid","mode":"fifo"|"udp"|"avb"}
+ *                  {"cmd":"apply","panel":"high"|"mid","mode":"fifo"|"udp"|"avb","navmd":true|false}
  *                    all modes apply the variant gate + self-start; they differ
  *                    only in the sink. avb = stock avb:// sink (the mode the app
  *                    applies; the render joins the media bus); udp = udp://
  *                    stream sink (the bridge accepts a stream where it rejects a
  *                    file); fifo = file:// FIFO sink
+ *                    navmd is optional: omitted preserves its disk bytes; true
+ *                    drops guidance metadata, false restores it. The anchor is
+ *                    privileged configuration, never supplied by the socket.
  *                  {"cmd":"revert"}
  *                  {"cmd":"reboot"} activate a deferred patch with a normal
  *                                   system reboot (so carplay next starts from
@@ -36,7 +39,9 @@
  *                                   (capture-reply to the asker; every client gets
  *                                   ev capture, also once a second)
  *   patchd -> app  {"ev":"status","state":...,"panel":...,"mode":...,"res":...,"safe":...,"reason":...,"carplay":...,
- *                   "pending":...,"conflict":...}
+ *                   "pending":...,"conflict":...,"navmd":{"state":...,"reason":...}}
+ *                    navmd: on | off | unavailable | unknown, on-disk only;
+ *                    pending separately describes the running carplay.
  *                    state: original | patched | unknown | busy | error
  *                    mode (when patched): fifo | udp | avb
  *                    res, safe (when the IC_HIGH geometry is patched): the
@@ -104,6 +109,8 @@ var quitting = false;        /* SIGTERM: finish the active patch operation */
  * carplay (that power-cycles the unit via the crash handler). */
 var REBOOT_CMD = (process.env.WOC_REBOOT_CMD || 'systemctl reboot').split(' ');
 var statusInFlight = false;  /* coalesce the carplay_patch status spawns */
+var statusWaiters = [];
+var statusGeneration = 0;
 var MAX_LINE = 64 * 1024;    /* drop a client that floods without a newline */
 
 /* A ring of recent carplay log lines (carplay.service's journal and, by marker,
@@ -185,7 +192,90 @@ function groupId(name) {
     return -1;
 }
 
-var cachedState = { state: 'unknown', panel: null, mode: null, res: null, safe: null };   /* last good readState */
+var cachedState = { state: 'unknown', panel: null, mode: null, res: null, safe: null, navmd: { state: 'unknown', reason: 'status not yet read' } };   /* last good readState */
+
+/* Never let merely provisioning an anchor opt any patcher invocation in. */
+function patcherEnv() {
+    var env = Object.assign({}, process.env);
+    delete env.WOC_NAVMD_ANCHOR;
+    return env;
+}
+
+/* Environment is provisioned by the privileged service. The file is opened
+ * without following symlinks and checked through its fd, not by pathname. */
+function configuredNavmd() {
+    var value, fd;
+    if (Object.prototype.hasOwnProperty.call(process.env, 'WOC_NAVMD_ANCHOR')) {
+        value = process.env.WOC_NAVMD_ANCHOR;
+    } else {
+        var file = process.env.WOC_NAVMD_ANCHOR_FILE || '/var/opt/waze-on-cluster/navmd-anchor';
+        try {
+            if (typeof fs.constants.O_NOFOLLOW !== 'number') throw new Error('O_NOFOLLOW unavailable');
+            fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+            var st = fs.fstatSync(fd);
+            if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o022))
+                throw new Error('anchor file must be regular, owned by the daemon UID and not group/world writable');
+            if (st.size < 1 || st.size > 1024) throw new Error('anchor file must contain 1..1024 bytes');
+            var buf = Buffer.alloc(1025), n = 0, r;
+            while (n < buf.length && (r = fs.readSync(fd, buf, n, buf.length - n, null)) > 0) n += r;
+            if (n < 1 || n > 1024) throw new Error('anchor file must contain 1..1024 bytes');
+            value = buf.slice(0, n).toString('utf8');
+            if (!Buffer.from(value, 'utf8').equals(buf.slice(0, n))) throw new Error('anchor file is not valid UTF-8');
+            if (value.charAt(value.length - 1) === '\n') value = value.slice(0, -1);
+        } catch (e) {
+            return { error: e.code === 'ENOENT' ? 'configure WOC_NAVMD_ANCHOR or provision ' + file : 'untrusted navmd anchor: ' + e.message,
+                     unavailable: e.code === 'ENOENT' };
+        } finally { if (fd !== undefined) fs.closeSync(fd); }
+    }
+    if (Buffer.byteLength(value, 'utf8') < 1 || Buffer.byteLength(value, 'utf8') > 1024 ||
+        !value.trim() || /[\x00-\x1f\x7f-\x9f]/.test(value) || value.indexOf('--') === 0)
+        return { error: 'invalid navmd anchor: provide one nonempty line without control characters (1..1024 bytes)' };
+    return { anchor: value };
+}
+
+/* Presence is only a routing hint. The patcher validates the record and backup;
+ * corrupt metadata must not be bypassed with a new configured anchor. */
+function hasNavmdRecord() {
+    try {
+        var meta = JSON.parse(fs.readFileSync(TARGET + '.woc-orig.json', 'utf8'));
+        return !!meta && Object.prototype.hasOwnProperty.call(meta, 'navmd');
+    } catch (e) { return e.code !== 'ENOENT'; }
+}
+
+/* Unanchored first: a saved identity always wins over configuration. */
+function probeState(cb) {
+    var recorded = hasNavmdRecord(), coreText = '';
+    function run(anchor, next) {
+        var args = [PATCHER, 'status', '--target', TARGET];
+        if (anchor !== undefined) args.push('--navmd', anchor);
+        cp.execFile(process.execPath, args, { timeout: 15000, env: patcherEnv() }, next);
+    }
+    run(undefined, function (err, out, errOut) {
+        var text = (out || '') + '';
+        coreText = text;
+        var cfg = configuredNavmd();
+        if (recorded || /^navmd:\s/m.test(text) || err) return finish(err, text, errOut, recorded, null);
+        if (cfg.anchor !== undefined) {
+            return run(cfg.anchor, function (e, o, eo) { finish(e, (o || '') + '', eo, false, cfg); });
+        }
+        finish(err, text, errOut, false, cfg);
+    });
+    function finish(err, text, errOut, recorded, cfg) {
+        var m = /^navmd:\s+(ORIGINAL|DROPPED|UNKNOWN)(?:\s*\((.*)\))?/m.exec(text);
+        var navmd;
+        if (err) navmd = { state: 'unknown', reason: 'navmd status failed: ' + ((errOut || '').trim() || err.message) };
+        else if (m && m[1] === 'ORIGINAL') navmd = { state: 'off' };
+        else if (m && m[1] === 'DROPPED') navmd = { state: 'on' };
+        else if (m) navmd = { state: 'unknown', reason: m[2] || 'navmd cannot be verified' };
+        else if (recorded) navmd = { state: 'unknown', reason: 'recorded navmd identity could not be classified' };
+        else if (cfg && cfg.error) navmd = { state: cfg.unavailable ? 'unavailable' : 'unknown', reason: cfg.error };
+        else navmd = { state: 'unknown', reason: 'configured navmd anchor is unsupported or carplay status is unreadable' };
+        /* A supported anchor also explains a legacy optional edit to the core
+         * classifier. Unsupported anchors must not gate Enable map. */
+        var core = cfg && cfg.anchor !== undefined && (navmd.state === 'on' || navmd.state === 'off') ? text : coreText;
+        cb(err, core, navmd, recorded, cfg && cfg.anchor);
+    }
+}
 
 /* Why the patch should not be written without the user asking, or null: a
  * carplay.service that starts another program (another tool's drop-in, which
@@ -244,11 +334,18 @@ function writePending(action) {
  * runs at a time; a caller that arrives while one is in flight gets the last
  * known state (never null), so the status/logs ops always carry a real value. */
 function readState(cb) {
-    if (statusInFlight) { cb(cachedState); return; }
+    statusWaiters.push(cb);
+    if (statusInFlight) return;
     statusInFlight = true;
-    cp.execFile(process.execPath, [PATCHER, 'status', '--target', TARGET], { timeout: 15000 }, function (err, out) {
+    var generation = statusGeneration;
+    probeState(function (err, text, navmd) {
         statusInFlight = false;
-        var text = (out || '') + '';
+        if (generation !== statusGeneration) {
+            var waiting = statusWaiters;
+            statusWaiters = [];
+            waiting.forEach(function (f) { readState(f); });
+            return;
+        }
         var variant = /variant:\s+PATCHED -> IC_(HIGH|MID)/.exec(text);
         var redirect = /sink:\s+REDIRECTED -> (\S+)/.exec(text);
         var sinkRedirected = !!redirect;
@@ -314,14 +411,16 @@ function readState(cb) {
         if (pending) { state = 'unknown'; mode = null; reason = pending.reason; carplay = 'deferred'; }
         cachedState = { state: state, panel: variant ? variant[1].toLowerCase() : null, mode: mode, res: res, safe: safe, reason: reason, carplay: carplay,
                         pending: pending ? pending.action || 'apply' : null, pendingBy: pending ? pending.by : null,
-                        conflict: conflict, binary: binary, known: known, backup: hasBackup, restorable: restorable };
-        cb(cachedState);
+                        conflict: conflict, binary: binary, known: known, backup: hasBackup, restorable: restorable, navmd: navmd };
+        var waiting = statusWaiters;
+        statusWaiters = [];
+        waiting.forEach(function (f) { f(cachedState); });
     });
 }
 
 function status(extra) {
     readState(function (st) {
-        var msg = { ev: 'status', state: busy ? 'busy' : st.state, panel: st.panel, mode: st.mode, res: st.res, safe: st.safe };
+        var msg = { ev: 'status', state: busy ? 'busy' : st.state, panel: st.panel, mode: st.mode, res: st.res, safe: st.safe, navmd: busy ? { state: 'unknown', reason: 'patch operation in progress' } : st.navmd };
         if (!busy && st.reason) msg.reason = st.reason;
         if (!busy && st.carplay) msg.carplay = st.carplay;
         if (!busy && st.pending) msg.pending = st.pending;
@@ -716,7 +815,7 @@ function runPatch(args, action, noRestart, done) {
         if (!restartable && !fs.existsSync(RUNNING)) {
             try { fs.linkSync(TARGET, RUNNING); linked = true; } catch (e) { log('keeping the running carplay linked failed: ' + e.message); }
         }
-        cp.execFile(process.execPath, [PATCHER].concat(args), { timeout: 60000 }, function (pErr, out, errOut) {
+        cp.execFile(process.execPath, [PATCHER].concat(args), { timeout: 60000, env: patcherEnv() }, function (pErr, out, errOut) {
             var text = (out || '') + '';
             text.split('\n').forEach(function (l) { if (l.trim()) log(l.trim()); });
             if (errOut) (errOut + '').split('\n').forEach(function (l) { if (l.trim()) log(l.trim()); });
@@ -767,7 +866,7 @@ function runPatch(args, action, noRestart, done) {
  * -> the file:// FIFO (the bridge rejects it on the car). `unproven`: the
  * user's Enable map, which also patches a build outside the proven list;
  * install-time activation never does. */
-function apply(panel, mode, noRestart, unproven, done) {
+function apply(panel, mode, noRestart, unproven, done, navmdArgs) {
     if (panel !== 'high' && panel !== 'mid') { done(new Error('panel must be high or mid')); return; }
     var args = ['apply', '--panel', panel, '--target', TARGET, '--yes'].concat(unproven ? ['--unproven'] : []);
     if (mode === 'avb') {
@@ -780,12 +879,12 @@ function apply(panel, mode, noRestart, unproven, done) {
         log('apply IC_' + panel.toUpperCase() + ' + capture to ' + FIFO);
         args.splice(3, 0, '--capture', FIFO);
     }
-    runPatch(args, 'apply', noRestart, done);
+    runPatch(args.concat(navmdArgs || []), 'apply', noRestart, done);
 }
 
-function revert(noRestart, dropBackup, done) {
+function revert(noRestart, dropBackup, done, anchor) {
     log('revert');
-    runPatch(['revert', '--target', TARGET, '--yes'].concat(dropBackup ? ['--drop-backup'] : []), 'revert', noRestart, done);
+    runPatch(['revert', '--target', TARGET, '--yes'].concat(dropBackup ? ['--drop-backup'] : [], anchor !== undefined ? ['--navmd', anchor] : []), 'revert', noRestart, done);
 }
 
 function handle(line, sock) {
@@ -830,7 +929,7 @@ function handle(line, sock) {
         rebooting = true;
         log('restart requested: normal system reboot to activate the pending patch (' + REBOOT_CMD.join(' ') + ')');
         try { sock.write(JSON.stringify({ ev: 'reboot-reply', ok: true }) + '\n'); } catch (e) {}
-        send({ ev: 'status', state: 'busy', reason: 'restarting the head unit' });
+        send({ ev: 'status', state: 'busy', reason: 'restarting the head unit', navmd: { state: 'unknown', reason: 'status not refreshed' } });
         cp.execFile(REBOOT_CMD[0], REBOOT_CMD.slice(1), { timeout: 30000 }, function (err) {
             if (err) {
                 rebooting = false;
@@ -844,34 +943,66 @@ function handle(line, sock) {
         return;
     }
 
-    if (busy || quitting || rebooting) { send({ ev: 'status', state: 'busy', reason: quitting ? 'patchd is stopping' : rebooting ? 'a restart is in progress' : 'another operation is running' }); return; }
+    if (busy || quitting || rebooting) { send({ ev: 'status', state: 'busy', reason: quitting ? 'patchd is stopping' : rebooting ? 'a restart is in progress' : 'another operation is running', navmd: { state: 'unknown', reason: 'patch operation in progress' } }); return; }
 
     if (msg.cmd === 'apply' || msg.cmd === 'revert') {
+        if ((Object.prototype.hasOwnProperty.call(msg, 'navmd') && (msg.cmd !== 'apply' || typeof msg.navmd !== 'boolean')) ||
+            Object.prototype.hasOwnProperty.call(msg, 'anchor') || Object.prototype.hasOwnProperty.call(msg, 'navmdAnchor') ||
+            Object.prototype.hasOwnProperty.call(msg, 'navmd_anchor')) {
+            send({ ev: 'status', state: 'error', reason: 'invalid navmd request; anchors must be provisioned by an administrator', navmd: { state: 'unknown', reason: 'status not refreshed' } });
+            return;
+        }
         var op = msg.cmd;
         var panel = msg.panel;
         var mode = (msg.mode === 'avb' || msg.mode === 'udp') ? msg.mode : 'fifo';   /* capture mode; default fifo */
         busy = true;
-        status({ reason: op === 'apply' ? 'applying' : 'reverting' });
-        var fn = op === 'apply' ? function (cb) { apply(panel, mode, false, true, cb); } : function (cb) { revert(false, false, cb); };
+        /* Publish before any asynchronous status probe or lock acquisition:
+         * even an immediate no-op/failure must have a preceding busy event. */
+        send({ ev: 'status', state: 'busy', reason: op === 'apply' ? 'applying' : 'reverting',
+               panel: cachedState.panel, mode: cachedState.mode, res: cachedState.res, safe: cachedState.safe,
+               navmd: { state: 'unknown', reason: 'patch operation in progress' } });
+
         /* Hold the shared remount lock so the boot-recovery service does not
          * remount / at the same time. User-driven, so it proceeds after a short
          * wait even if the lock looks stuck; recovery yields to it. */
         lock.acquire(5000, function (got) {
             if (!got) log('remount lock busy; proceeding (user operation)');
-            fn(function (pErr, roErr, activation) {
+            function finishOperation(pErr, roErr, activation) {
+                statusGeneration++;
                 lock.release();
                 busy = false;
                 if (roErr) log('WARNING: ' + roErr.message + ' — run: mount -o remount,ro /');
                 if (pErr || roErr) {
                     var reason = [pErr && pErr.message, roErr && roErr.message].filter(Boolean).join('; ');
                     log(op + ' failed: ' + reason);
-                    send({ ev: 'status', state: 'error', reason: reason });
+                    status({ state: 'error', reason: reason });
                 } else {
                     log(op + ' done' + (activation === 'restarted' ? '' : activation === 'deferred' ? ' (' + PENDING_REASON[op] + ')' : ' (no change)'));
                     status(activation ? { carplay: activation } : {});
                 }
                 quitWhenIdle();
-            });
+            }
+            if (op === 'apply' && msg.navmd === undefined) {
+                apply(panel, mode, false, true, finishOperation);
+            } else {
+                probeState(function (err, text, navmd, recorded, anchor) {
+                    if (op === 'apply') {
+                        if (err || (navmd.state !== 'on' && navmd.state !== 'off')) {
+                            finishOperation(new Error(navmd.reason || 'navmd status cannot be verified'));
+                            return;
+                        }
+                        var args = msg.navmd ? ['--navmd-on'] : ['--navmd-off'];
+                        if (!recorded && anchor !== undefined) args.push('--navmd', anchor);
+                        apply(panel, mode, false, true, finishOperation, args);
+                    } else {
+                        /* Only a successfully classified trusted configuration can
+                         * supplement legacy full restore; the patcher refuses
+                         * unidentified optional edits rather than guessing. */
+                        revert(false, false, finishOperation, !recorded && !err &&
+                            (navmd.state === 'on' || navmd.state === 'off') ? anchor : undefined);
+                    }
+                });
+            }
         });
     }
 }
@@ -982,7 +1113,13 @@ function oneShot(which) {
             }
             var before = sha(TARGET);
             var run = p.op === 'apply' ? function (cb) { log(which + ': applying the map patch'); apply('high', 'avb', true, false, cb); }
-                : function (cb) { log(which + ': reverting the map patch'); revert(true, true, cb); };
+                : function (cb) {
+                    log(which + ': reverting the map patch');
+                    probeState(function (err, text, navmd, recorded, anchor) {
+                        revert(true, true, cb, !recorded && !err &&
+                            (navmd.state === 'on' || navmd.state === 'off') ? anchor : undefined);
+                    });
+                };
             run(function (pErr, roErr, activation, refused) {
                 var written = sha(TARGET) !== before;
                 if (roErr) log('WARNING: ' + roErr.message + ' — the next head-unit start mounts / read-only again');
