@@ -15,7 +15,7 @@
  * or open is retried every second, retry_sources), the decoder comes up at
  * the stream's first SPS (a raw Annex-B feed: at its first bytes), decodes
  * from then on whether or not the map is shown, and stays up for the service
- * lifetime; a later stream resyncs at its own SPS.
+ * lifetime; a later stream is picked up at its own SPS.
  *
  * Threads. The AVB bridge's callback and the UDP reader only copy each
  * datagram into a bounded queue (packet_queue.h, kQueuePackets or
@@ -102,9 +102,11 @@ public:
     /* Every decoded frame the same blank picture while they keep coming,
      * after the stream showed a picture (freeze_watch.h). */
     bool frozen(int64_t now_ms) const;
+    /* What the stream has to show (FreezeWatch::picture). */
+    Picture picture(int64_t now_ms) const;
     /* Whether CarPlay's cluster stream is live (FreezeWatch::live). Main
      * thread. */
-    void set_live(bool on);
+    void set_live(bool on, int64_t now_ms);
     /* When the last frame of the decode size was decoded; -1 for none. */
     int64_t last_frame_ms() const { return last_frame_ms_.load(); }
     /* The last minute's pictures of the decode size, how many of them
@@ -116,8 +118,8 @@ public:
                 uint64_t *overflows);
     /* The stream's status reason and its detail for the log and probe.txt
      * (stream_health.h), and whether it is lost. */
-    std::string stream_reason(const ResyncState &resync) const;
-    std::string stream_detail(const ResyncState &resync) const;
+    std::string stream_reason() const;
+    std::string stream_detail() const;
     bool stream_lost() const;
     /* Decode errors so far, and the last one's text in *last. */
     uint32_t decode_errors(std::string *last) const;
@@ -138,7 +140,7 @@ public:
 
     /* The keyframe wait (keyframe_wait.h), sampled by track_keyframe_wait
      * about once a second from the main loop, which also tells the stream's
-     * health; patchd reads it (stream.json) to resync. */
+     * health. */
     int64_t keyframe_wait_ms(int64_t now_ms) const { return keyframe_wait_.wait_ms(now_ms); }
     void track_keyframe_wait(int64_t now_ms);
 

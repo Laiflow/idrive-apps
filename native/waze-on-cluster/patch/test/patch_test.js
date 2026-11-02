@@ -72,6 +72,7 @@ try {
     r = run(['status', '--target', tgt]);
     ok('status: pristine, variant ORIGINAL, sink ORIGINAL, selfstart ORIGINAL, res ORIGINAL',
         /variant:\s+ORIGINAL/.test(r.out) && /sink:\s+ORIGINAL/.test(r.out) && /selfstart:\s+ORIGINAL/.test(r.out) && /res:\s+ORIGINAL \(IC_HIGH advertises 1920x900\)/.test(r.out) && /pristine/.test(r.out), r.out);
+    ok('status: proven, version 22.28.3', /proven:\s+yes/.test(r.out) && /version:\s+22\.28\.3/.test(r.out), r.out);
     ok('stock res immediates are the proven ones', JSON.stringify(resImmediates(SRCBUF)) === JSON.stringify(RES_STOCK), JSON.stringify(resImmediates(SRCBUF)));
 
     r = run(['verify', '--target', tgt]);
@@ -173,15 +174,29 @@ try {
     r = run(['apply', '--target', tgt, '--panel', 'high', '--capture', '--yes']);
     ok('--capture without a value is refused', r.code !== 0 && /--capture needs/.test(r.out) && sha256(tgt) === ORIG_SHA, r.out);
 
-    /* revert refuses to overwrite a binary it no longer recognises (e.g. a
-     * firmware update replaced carplay and left the backup behind) */
+    /* A binary of the backup's build the locator does not recognise: revert
+     * writes the whole backup. */
     run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
     var mangled = Buffer.from(fs.readFileSync(tgt));
     mangled.writeUInt32LE(0x11223344, 0x2ba4d4);   /* corrupt the converter table -> unknown variant */
     fs.writeFileSync(tgt, mangled);
+    r = run(['status', '--target', tgt]);
+    ok('status: an unrecognised binary of the backup\'s build is restorable', /known:\s+NO/.test(r.out) && /restorable:\s+yes/.test(r.out), r.out);
     r = run(['revert', '--target', tgt, '--yes', '--drop-backup']);
-    ok('revert refuses an unrecognised current binary, keeping the backup', r.code !== 0 && /not a recognised/.test(r.out) &&
-        fs.existsSync(tgt + '.woc-orig'), r.out);
+    ok('revert restores it whole, without --force, and drops the backup', r.code === 0 && sha256(tgt) === ORIG_SHA &&
+        !fs.existsSync(tgt + '.woc-orig') && !fs.existsSync(tgt + '.woc-orig.json'), r.out);
+
+    /* Another build over the backup (a firmware update replaced carplay and
+     * left the backup behind): refused; --force writes the backup. */
+    run(['apply', '--target', tgt, '--panel', 'high', '--yes']);
+    var replaced = Buffer.from(fs.readFileSync(tgt));
+    replaced[replaced.indexOf(Buffer.from('5de62156575d737391ea42254e778a97dbbb51f8', 'hex'))] ^= 0xff;
+    fs.writeFileSync(tgt, replaced);
+    r = run(['status', '--target', tgt]);
+    ok('status: another build is not restorable', /restorable:\s+no/.test(r.out), r.out);
+    r = run(['revert', '--target', tgt, '--yes']);
+    ok('revert refuses another build, keeping it and the backup', r.code !== 0 && /another build/.test(r.out) &&
+        fs.readFileSync(tgt).equals(replaced) && fs.existsSync(tgt + '.woc-orig'), r.out);
     r = run(['revert', '--target', tgt, '--yes', '--force']);
     ok('revert --force restores it to the backed-up original', r.code === 0 && sha256(tgt) === ORIG_SHA, r.out);
 
@@ -199,6 +214,8 @@ try {
     var expect = Buffer.from(SRCBUF);
     Buffer.from('e900000000', 'hex').copy(expect, 0x9f9a0);
     ok('revert: the result is the original with only their edit', reverted.equals(expect));
+    r = run(['status', '--target', tgt]);
+    ok('status with only their edit left: not restorable', /^restorable: no\b/m.test(r.out), r.out);
     r = run(['revert', '--target', tgt, '--yes']);
     ok('revert with only their edit left: nothing to do, the file untouched', r.code === 0 && /nothing to do/.test(r.out) && fs.readFileSync(tgt).equals(expect), r.out);
     r = run(['revert', '--target', tgt, '--yes', '--force']);
@@ -403,13 +420,20 @@ try {
     var ot = path.join(dir, 'carplay_other');
     fs.writeFileSync(ot, other);
     r = run(['status', '--target', ot]);
-    ok('unproven build: pristine by its stock sites', /known:\s+yes, pristine build a2e62156/.test(r.out), r.out);
-    r = run(['apply', '--target', ot, '--panel', 'high', '--sink', 'udp://127.0.0.1:20557?mime_type=video/H264', '--yes']);
+    ok('unproven build: pristine by its stock sites, not proven, its version', /known:\s+yes, pristine build a2e62156/.test(r.out) &&
+        /proven:\s+no/.test(r.out) && /version:\s+22\.28\.3/.test(r.out), r.out);
+    r = run(['apply', '--target', ot, '--panel', 'high', '--yes']);
+    ok('unproven build: apply without --unproven refuses, no write, no backup', r.code !== 0 && /is not a proven build; pass --unproven/.test(r.out) &&
+        fs.readFileSync(ot).equals(other) && !fs.existsSync(ot + '.woc-orig'), r.out);
+    r = run(['apply', '--target', ot, '--panel', 'high', '--sink', 'udp://127.0.0.1:20557?mime_type=video/H264', '--unproven', '--yes']);
     ok('unproven build: apply writes all four edits', r.code === 0 && /patched OK/.test(r.out) && /variant -> IC_HIGH/.test(r.out) &&
         /self-start -> requestStream/.test(r.out) && /resolution -> 1088x480/.test(r.out), r.out);
     var od = diffs(other, fs.readFileSync(ot));
     ok('unproven build: the diff stays in the edit regions', od.length > 0 && od.every(function (x) {
         return (x >= SLOT && x < SLOT + 4) || (x >= SINK && x < SINK + SINK_LEN) || (x >= CALL && x < CALL + CALL_LEN) || inResRegion(x); }));
+    r = run(['apply', '--target', ot, '--panel', 'mid', '--yes']);
+    ok('unproven build: a later apply (our backup present) needs no --unproven', r.code === 0 && /variant -> IC_MID/.test(r.out), r.out);
+    r = run(['apply', '--target', ot, '--panel', 'high', '--sink', 'udp://127.0.0.1:20557?mime_type=video/H264', '--yes']);
     r = run(['verify', '--target', ot]);
     ok('unproven build: verify passes', r.code === 0 && /IC_HIGH, sink udp:\/\/127\.0\.0\.1:20557/.test(r.out), r.out);
     r = run(['revert', '--target', ot, '--yes']);

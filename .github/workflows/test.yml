@@ -1,35 +1,228 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Robert Nisipeanu
-# Every test, the head-unit builds and the reproducibility check.
+# Every test, the head-unit builds and the reproducibility check, as parallel
+# jobs: on a pull request, the jobs of the components it changes; on main,
+# every job. The `ci` job is the one result to require.
 name: Test
 
+# A pull request runs once, on its merge commit; main runs on every push.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# a new push to a pull request cancels its run in progress; each push to main
+# runs in a group of its own
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  # What the pull request changes, by path:
+  #   native/cluster-render/   both tools' jobs (waze-on-cluster compiles the
+  #                            renderer's client, kit and core, and builds in
+  #                            its image)
+  #   native/waze-on-cluster/  its jobs
+  #   apps/<id>/               the app's tests
+  #   native/<id>/test/        tests only: the tool's artifact leaves out test/
+  #   native/<id>/*.md, README.md, LICENSE, LICENSES/   nothing (a nested
+  #                            .md counts toward its tool's artifact)
+  #   release/, tools/, .github/, any other path    every job
+  # Each changed component (a folder with a component.json or release.json in
+  # the commit tested) is built twice from a clean export, on two runners, and
+  # the artifacts compared.
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      cluster-render: ${{ steps.paths.outputs.cluster-render }}
+      waze-on-cluster: ${{ steps.paths.outputs.waze-on-cluster }}
+      app: ${{ steps.paths.outputs.app }}
+      release: ${{ steps.paths.outputs.release }}
+      components: ${{ steps.paths.outputs.components }}
+    steps:
+      - id: paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.sha }}
+        run: |
+          cr=false woc=false app=false all=false ids='' keep=''
+          if [ -z "$PR" ]; then
+            all=true
+          else
+            files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)')
+            while read -r f; do
+              # a tool's top-level notes (native/<id>/*.md) are not in its artifact
+              r=${f#native/*/}
+              if [ "$r" != "$f" ] && [ "${r%.md}" != "$r" ] && [ "${r#*/}" = "$r" ]; then
+                continue
+              fi
+              case $f in
+              README.md|LICENSE|LICENSES/*) ;;
+              native/cluster-render/test/*) cr=true woc=true ;;
+              native/cluster-render/*) cr=true woc=true ids="$ids native/cluster-render native/waze-on-cluster" ;;
+              native/waze-on-cluster/test/*) woc=true ;;
+              native/waze-on-cluster/*) woc=true ids="$ids native/waze-on-cluster" ;;
+              native/*/test/*) ;;
+              native/*/*) f=${f#native/} ids="$ids native/${f%%/*}" ;;
+              apps/*/*) f=${f#apps/} app=true ids="$ids apps/${f%%/*}" ;;
+              *) all=true ;;   # .github/, release/, tools/, and what no rule names
+              esac
+            done <<< "$files"
+          fi
+          if [ "$all" = true ]; then
+            cr=true woc=true app=true ids=all
+          else
+            # A folder without a component.json (native/) or release.json
+            # (apps/) in the commit tested, such as a removed component, is
+            # left out of the release builds.
+            # shellcheck disable=SC2086 # one folder per word
+            for d in $(printf '%s\n' $ids | sort -u); do
+              m=component.json
+              [ "${d%%/*}" = apps ] && m=release.json
+              if err=$(gh api "repos/$REPO/contents/$d/$m?ref=$SHA" --silent 2>&1); then
+                keep="$keep ${d#*/}"
+              elif ! grep -q 'HTTP 404' <<< "$err"; then
+                echo "$d/$m: $err"
+                exit 1
+              fi
+            done
+            ids=$keep
+          fi
+          # shellcheck disable=SC2086 # one id per word
+          ids=$(printf '%s\n' $ids | sort -u | paste -sd' ' -)
+          {
+            echo "cluster-render=$cr"
+            echo "waze-on-cluster=$woc"
+            echo "app=$app"
+            echo "release=$([ -n "$ids" ] && echo true || echo false)"
+            echo "components=$([ "$ids" = all ] || echo "$ids")"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  cluster-render:
+    needs: changes
+    if: needs.changes.outputs.cluster-render == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # release.js check: SOURCE_DATE_EPOCH comes from each component's last commit
-          fetch-depth: 0
           persist-credentials: false
-
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22.12.0
-
-      # the head-unit builds and test-x86 run in Docker, preinstalled on the runner
       - run: make -C native/cluster-render test
-      - run: make -C native/cluster-render test-x86 target
-      - run: make -C native/waze-on-cluster test
-      - run: make -C native/waze-on-cluster test-x86 target
+
+  # the unit's toolchain (gcc 7.5) in Docker, preinstalled on the runner
+  cluster-render-x86:
+    needs: changes
+    if: needs.changes.outputs.cluster-render == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-image
+      - run: make -C native/cluster-render test-x86
+
+  waze-on-cluster:
+    needs: changes
+    if: needs.changes.outputs.waze-on-cluster == 'true' || needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22.12.0
+      - if: needs.changes.outputs.waze-on-cluster == 'true'
+        run: make -C native/waze-on-cluster test
       - run: node apps/robertn_waze_cluster/tools/test_control.js
       - run: node apps/robertn_waze_cluster/tools/test_page.js
+
+  waze-on-cluster-x86:
+    needs: changes
+    if: needs.changes.outputs.waze-on-cluster == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-image
+      - run: make -C native/waze-on-cluster test-x86
+
+  # release.js check across two runners: two clean builds of each changed
+  # component, compared byte for byte by the release job
+  release-a:
+    needs: changes
+    if: needs.changes.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      artifacts: ${{ steps.build.outputs.artifacts }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: build
+        uses: ./.github/actions/release-build
+        with:
+          components: ${{ needs.changes.outputs.components }}
       - run: node release/test/release_test.js
-      - run: node release/release.js check
+
+  release-b:
+    needs: changes
+    if: needs.changes.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      artifacts: ${{ steps.build.outputs.artifacts }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: build
+        uses: ./.github/actions/release-build
+        with:
+          components: ${{ needs.changes.outputs.components }}
+
+  release:
+    needs: [release-a, release-b]
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          A: ${{ needs.release-a.outputs.artifacts }}
+          B: ${{ needs.release-b.outputs.artifacts }}
+        run: |
+          # shellcheck disable=SC2086 # <id>@<version> <sha256> pairs
+          printf '%s %s\n' $A > a.txt
+          # shellcheck disable=SC2086
+          printf '%s %s\n' $B > b.txt
+          if [ -z "$A" ] || ! diff a.txt b.txt; then
+            echo "the two builds differ"
+            exit 1
+          fi
+          awk '{ print "reproducible  " $1 }' a.txt
+
+  # The one result: fails when a job failed or was cancelled; a job left out
+  # for what the pull request changes passes.
+  ci:
+    needs: [changes, cluster-render, cluster-render-x86, waze-on-cluster, waze-on-cluster-x86, release-a, release-b,
+            release]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do
+            case $r in success|skipped) ;; *) exit 1 ;; esac
+          done

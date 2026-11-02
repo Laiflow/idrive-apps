@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Robert Nisipeanu
+name: Release build
+description: >
+  release.js build of the given components from a clean export of HEAD, and
+  their artifacts' sha256. Needs a checkout with full history
+  (SOURCE_DATE_EPOCH comes from each component's last commit).
+inputs:
+  components:
+    description: Component ids, space-separated (empty builds every component)
+    required: false
+    default: ''
+outputs:
+  artifacts:
+    description: "<id>@<version> <sha256> pairs, space-separated"
+    value: ${{ steps.build.outputs.artifacts }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 22.12.0
+    # a tool's build is its make target: the head-unit binaries in Docker,
+    # every import checked against the unit's libraries
+    - uses: ./.github/actions/build-image
+    - id: build
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        node release/release.js build $COMPONENTS
+        echo "artifacts=$(node -p "require('./release/out/catalog.json').components
+          .map((c) => c.id + '@' + c.version + ' ' + c.artifact.sha256).join(' ')")" >> "$GITHUB_OUTPUT"

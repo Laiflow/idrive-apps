@@ -14,8 +14,11 @@ the map is on the cluster whenever CarPlay streams it, whether or not this
 app is open.
 
 Set **Instrument cluster > Central display area** to **Map view**: the Waze
-map replaces the stock map while CarPlay's cluster stream is live, and the
-stock map is back when it ends. **Off** works too, with an empty centre
+map replaces the stock map while CarPlay's cluster stream shows a map, and
+the stock map is back when the stream ends or shows none. Until a navigation
+app draws on the cluster (in Waze or Google Maps, once a route starts), the
+stock map stays and the page shows `Waiting for the phone's map — start
+navigation`. **Off** works too, with an empty centre
 instead of the stock map. With Route preview or Assisted Driving View the
 cluster's own content takes the centre. After changing the setting, CarPlay
 may need reconnecting before the map returns: the change can freeze the
@@ -31,7 +34,7 @@ One `LT_State_Wide` page:
 
 | Row | What it does |
 |---|---|
-| status | the patch and map state: `Patch pending — reboot to activate`, `Removal pending — reboot to finish`, `Original — enable the map`, `Not patched — <reason>`, `Applying patch…`, `Patched — waiting for CarPlay`, `Stream lost — reconnect CarPlay`, `Stream lost — restarting CarPlay`, `Starting map…`, `Showing: Waze map — 16 frames/s …`, `Map frozen — reconnect CarPlay`, `Map error: …`, `Patch service unavailable (reboot may be needed)` |
+| status | the patch and map state: `Patch pending — reboot to activate`, `Removal pending — reboot to finish`, `Original — enable the map`, `Not patched — <reason>`, `Applying patch…`, `Patched — waiting for CarPlay`, `Waiting for the phone's map — start navigation`, `Stream lost — reconnect CarPlay`, `Starting map…`, `Showing: Waze map — 16 frames/s …`, `Map frozen — reconnect CarPlay`, `Map error: …`, `Patch service unavailable (reboot may be needed)` |
 | setup | `Set Instrument cluster > Central display area to Map view`, always shown |
 | Enable map | applies the patch; shown while it is off, unknown or out of date and no change is pending |
 | Disable map | reverts the patch, which turns the map off; shown while patched and no change is pending |

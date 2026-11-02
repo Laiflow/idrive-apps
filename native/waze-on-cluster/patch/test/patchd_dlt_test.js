@@ -93,6 +93,7 @@ function startPatchd(name, dltReceive, extraEnv) {
         WOC_CARPLAY: path.join(dir, 'no-carplay'),
         WOC_DLT_RECEIVE: dltReceive,
         WOC_DLT_RETRY_MS: String(RETRY_MS),
+        WOC_DLT_RETRY_MAX_MS: String(RETRY_MS),
     }, extraEnv || {});
     var child = cp.spawn(process.execPath, [PATCHD], { env: env, stdio: ['ignore', 'ignore', 'inherit'] });
     patchds.push(child);
@@ -182,6 +183,10 @@ function faultRun(fault) {
 }
 
 async function main() {
+    /* The fault runs are separate processes with their own directories:
+     * they run alongside the cases below, and end before the backoff case,
+     * whose timing runs with nothing else in parallel. */
+    var faultRuns = FAULT ? null : ['early', 'late', 'uncaught'].map(faultRun);
     var p = startPatchd('a', FAKE);
     if (FAULT === 'early') throw new Error('injected early fault');
     var r;
@@ -255,6 +260,7 @@ async function main() {
      * capped, so a DLT daemon that never accepts a local client is not
      * respawned at a fixed short interval forever. A base well above a start's
      * own duration keeps the delay the dominant term in each run-to-run gap. */
+    var faultResults = await Promise.all(faultRuns);
     var BK_BASE = 200, BK_CAP = 800;
     var b = startPatchd('c', FAKE, { WOC_DLT_RETRY_MS: String(BK_BASE), WOC_DLT_RETRY_MAX_MS: String(BK_CAP) });
     setMode('refuse');
@@ -277,7 +283,7 @@ async function main() {
     var faults = ['early', 'late', 'uncaught'];
     for (var i = 0; i < faults.length; i++) {
         var f = faults[i];
-        var res = await faultRun(f);
+        var res = faultResults[i];
         ok('cleanup, ' + f + ' fault: the run fails with it', res.code !== 0 && res.out.indexOf('injected ' + f + ' fault') >= 0, res.code + '\n' + res.out);
         ok('cleanup, ' + f + ' fault: no patchd outlives the run', res.closed, res.out);
     }

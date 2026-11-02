@@ -58,11 +58,11 @@
  *   kFreshRetries times; then the ladder.
  * - A shown scene the display removes (no other content in the slot, the
  *   slot not locked, not our release) is asked for again no sooner than
- *   kRemovalWaitMs after the removal, or the ladder's step if longer: on the
- *   car the KOMBI failed the fetch 2 s after such a removal and took it
- *   7 s after. A fetch that fails within kNotReadyMs of a request made
- *   within kNotReadyWindowMs of the removal is the display not ready yet:
- *   asked again after kNotReadyRetryMs, up to kNotReadyRetries times; then
+ *   kRemovalWaitMs after the removal, or the ladder's step if longer. A
+ *   fetch that fails within kNotReadyMs of a request made within
+ *   kNotReadyWindowMs of the removal is the display not ready yet: asked
+ *   again after kNotReadyRetryMs, up to kNotReadyRetries times, which
+ *   covers the 7 s the KOMBI once took to accept the scene again; then
  *   the ladder.
  * - Warm scenes: a target's scene is published at its first request and
  *   stays published while the target is released, lost, refused or timed
@@ -171,8 +171,8 @@ public:
     virtual ~Scenes() {}
     virtual bool publish(const TargetSpec &t, std::string *err) = 0;
     virtual void unpublish(const TargetSpec &t) = 0;
-    /* t's published scene is requested again: the renderer that subscribes
-     * gets it whole. */
+    /* The display took t's published scene again (parked or shown): the
+     * renderer that subscribed to it at the fetch got it whole. */
     virtual void resent(const TargetSpec &, int64_t) {}
 };
 
@@ -217,11 +217,11 @@ public:
     static const int64_t kFreshSceneMs = 2000;
     static const int64_t kFreshRetryMs = 250;
     static const int kFreshRetries = 3;
-    static const int64_t kRemovalWaitMs = 5000;
+    static const int64_t kRemovalWaitMs = 2000;
     static const int64_t kNotReadyMs = 300;
     static const int64_t kNotReadyWindowMs = 10000;
     static const int64_t kNotReadyRetryMs = 1500;
-    static const int kNotReadyRetries = 3;
+    static const int kNotReadyRetries = 4;
 
     SlotManager(Port *port, Scenes *scenes);
     /* The scenes, when they are made after the slot manager (they read its
@@ -290,6 +290,7 @@ private:
         bool wanted = false, contend = false;
         bool requested = false;
         bool scene = false;          /* published */
+        bool resend_due = false;     /* asked for again warm: its resend is charged when the display takes it */
         int64_t scene_ms = 0;        /* when it was published */
         int fresh_retries = 0;       /* fetch failures since, asked again after kFreshRetryMs */
         bool fresh_retry = false;    /* the next request may go kFreshRetryMs after the last */
@@ -356,6 +357,7 @@ private:
     /* The table shows the target's own scene id in its slot. */
     bool named(int i) const;
     void park(int i, int64_t now_ms);
+    void charge_resend(int i, int64_t now_ms);
     void take_over(int i, int64_t now_ms);
     void settle_loss(int i, Holder h, bool removal, const std::string &reason, int64_t now_ms, int64_t lost_ms);
     bool yields(int i, int64_t now_ms);

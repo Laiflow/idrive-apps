@@ -5,7 +5,10 @@
  * once and pass its semantic checks; otherwise that edit carries ok:false and
  * a short reason naming what was not found. File offsets and virtual
  * addresses are converted through the ELF program headers, and function
- * bounds come from the .eh_frame_hdr search table. It only reads the buffer.
+ * bounds come from the .eh_frame_hdr search table. The variant, self-start and
+ * resolution sites are found from the functions that load their own name
+ * strings, and a site a dynamic relocation would rewrite at load is refused.
+ * It only reads the buffer.
  *
  * Node 8 on the unit, no dependencies.
  */
@@ -15,6 +18,9 @@ var SINK_STOCK = 'avb://media_transport.avb_streaming.15?mime_type=video/H264';
 var SINK_NEXT = 'mCarPlay->GetDisplaySource(';
 var REDIRECT = /^(file|udp|tcp):\/\/[^\0]+$/;
 var IC_HIGH = 0, IC_MID = 1, OTHER = 2, NOT_ACTIVE = 3, SLOT = 7;
+/* A function's own name string is loaded by its logging prologue, within
+ * ENTRY bytes of its start; functions of one source file lie within NEAR. */
+var ENTRY = 0x60, NEAR = 0x10000;
 
 /* A 64-bit field of a file under 4 GiB, else null. */
 function u64(buf, off) { return buf.readUInt32LE(off + 4) === 0 ? buf.readUInt32LE(off) >>> 0 : null; }
@@ -24,19 +30,30 @@ function parseElf(buf) {
     if (buf[4] !== 2 || buf[5] !== 1 || buf.readUInt16LE(18) !== 62) return { reason: 'not a 64-bit little-endian x86-64 ELF' };
     var phoff = u64(buf, 0x20), phentsize = buf.readUInt16LE(0x36), phnum = buf.readUInt16LE(0x38);
     if (phoff === null || phoff + phnum * phentsize > buf.length) return { reason: 'ELF program headers out of range' };
-    var elf = { load: [], exec: null, eh: null, notes: [] };
+    var elf = { load: [], exec: null, eh: null, notes: [], dyn: null, dynBad: false };
     for (var i = 0; i < phnum; i++) {
         var o = phoff + i * phentsize, type = buf.readUInt32LE(o);
         var seg = { off: u64(buf, o + 8), va: u64(buf, o + 16), size: u64(buf, o + 32) };
-        if (seg.off === null || seg.va === null || seg.size === null || seg.off + seg.size > buf.length) continue;
+        if (seg.off === null || seg.va === null || seg.size === null || seg.off + seg.size > buf.length) {
+            if (type === 2) elf.dynBad = true;          /* a PT_DYNAMIC outside the file */
+            continue;
+        }
         if (type === 1) {                               /* PT_LOAD; PF_X marks the code */
             elf.load.push(seg);
             if ((buf.readUInt32LE(o + 4) & 1) && !elf.exec) elf.exec = { off: seg.off, end: seg.off + seg.size };
         } else if (type === 0x6474e550) elf.eh = seg;   /* PT_GNU_EH_FRAME */
         else if (type === 4) elf.notes.push(seg);       /* PT_NOTE */
+        else if (type === 2) elf.dyn = seg;             /* PT_DYNAMIC */
     }
     if (!elf.exec) return { reason: 'no executable ELF segment' };
     return elf;
+}
+
+/* The GNU build-id of an ELF image as hex, or null: what tells one build
+ * from another without locating anything. */
+function elfBuildId(buf) {
+    var elf = parseElf(buf);
+    return elf.load ? buildId(buf, elf.notes) : null;
 }
 
 /* The GNU build-id note as hex, or null. */
@@ -60,6 +77,9 @@ function Image(buf, elf) {
     this.load = elf.load;
     this.exec = elf.exec;
     this.starts = funcStarts(buf, elf.eh);
+    this.dyn = elf.dyn;
+    this.dynBad = elf.dynBad;
+    this.callIndex = null;
 }
 Image.prototype.va = function (off) {
     for (var i = 0; i < this.load.length; i++) {
@@ -100,6 +120,17 @@ Image.prototype.calls = function (start, end) {
         if (this.buf[p] === 0xe8) { var to = this.rel(p + 1, p + 5); if (to !== null) out.push({ at: p, to: to }); }
     }
     return out;
+};
+
+/* The offsets of the `call rel32` instructions anywhere in the code
+ * segment that reach `to`. */
+Image.prototype.callers = function (to) {
+    if (!this.callIndex) {
+        var idx = {}, all = this.calls(this.exec.off, this.exec.end);
+        all.forEach(function (c) { (idx[c.to] = idx[c.to] || []).push(c.at); });
+        this.callIndex = idx;
+    }
+    return this.callIndex[to] || [];
 };
 
 /* Function start addresses from .eh_frame_hdr's search table (version 1,
@@ -179,14 +210,28 @@ function hex32(n) { return Buffer.from([n & 0xff, (n >>> 8) & 0xff, (n >>> 16) &
 var SWITCH = [0x80, 0x3f, null, 0x77, null, 0x0f, 0xb6, 0x07, 0x48, 0x8d, 0x15, null, null, null, null,
     0x48, 0x63, 0x04, 0x82, 0x48, 0x01, 0xd0, 0xff, 0xe0];
 
-function locateVariant(im) {
-    var tried = scan(im.buf, im.exec.off, im.exec.end, SWITCH).map(function (m) { return decodeSwitch(im, m); });
-    var good = tried.filter(function (t) { return t.ok; });
+/* The converter is the function loading its own name string
+ * (`bool …codingToInternal(const …eKI_KOMBI_VARIANT&, …KombiVariant::Values&)`),
+ * and its switch is the one in it. A switch elsewhere that decodes to the
+ * same mapping is another copy of the converter, which the edit would leave
+ * unpatched: refused. */
+function locateVariant(im, str, refs) {
+    if (!im.starts.length) return { ok: false, reason: 'variant: no function table' };
+    var conv = funcOfString(im, refs, str.conv, NAMES.conv[2]);
+    if (conv.err) return { ok: false, reason: conv.err };
+    var inside = [], outside = 0;
+    scan(im.buf, im.exec.off, im.exec.end, SWITCH).forEach(function (m) {
+        var d = decodeSwitch(im, m);
+        if (m >= conv.off && m < conv.end) inside.push(d);
+        else if (d.ok) outside++;
+    });
+    if (outside) return { ok: false, reason: 'variant: converter switch also outside codingToInternal' };
+    var good = inside.filter(function (t) { return t.ok; });
     if (good.length === 1) return good[0];
     if (good.length > 1) return { ok: false, reason: 'variant: converter switch found ' + good.length + ' times' };
     /* None decodes: a table large enough for the variant values is the
      * converter's, and its reason says what is wrong with it. */
-    var sized = tried.filter(function (t) { return !t.small; });
+    var sized = inside.filter(function (t) { return !t.small; });
     return sized.length === 1 ? sized[0] : { ok: false, reason: 'variant: converter switch not found' };
 }
 
@@ -242,28 +287,55 @@ function locateSink(buf) {
     return { ok: true, offset: found[0], len: len };
 }
 
+/* The slot is the string one `lea` loads; nothing loads a string inside it (a
+ * merged string a rewrite would change). `refs` holds the slot's offsets. */
+function sinkRefs(s, refs) {
+    if (!s.ok) return s;
+    function loads(o) { return (refs[o] || []).length; }
+    if (loads(s.offset) !== 1) return { ok: false, reason: 'sink: URL slot loaded ' + loads(s.offset) + ' times (want 1)' };
+    for (var i = 1; i < s.len; i++) if (loads(s.offset + i)) return { ok: false, reason: 'sink: another string inside the URL slot' };
+    return s;
+}
+
 /* ---- Edit 3: the self-start call retarget ------------------------------- */
 
 var NAMES = {
-    ss: ['AlternateDisplays::setStreamStatus(', /^void [\w:]*AlternateDisplays::setStreamStatus\(/, 'self-start: setStreamStatus'],
-    osu: ['AlternateDisplays::onSuggestUi()', /^void [\w:]*AlternateDisplays::onSuggestUi\(\)$/, 'self-start: onSuggestUi'],
-    rs: ['AlternateDisplays::requestStream()', /^void [\w:]*AlternateDisplays::requestStream\(\)$/, 'self-start: requestStream'],
+    conv: ['codingToInternal(const CodingKOMBI_HUD::eKI_KOMBI_VARIANT&',
+        /^bool (?:\w+::)*codingToInternal\(const (?:\w+::)*eKI_KOMBI_VARIANT&, (?:\w+::)*KombiVariant::Values&\)$/, 'variant: codingToInternal'],
+    ss: ['AlternateDisplays::setStreamStatus(', /^void (?:\w+::)*AlternateDisplays::setStreamStatus\(/, 'self-start: setStreamStatus'],
+    osu: ['AlternateDisplays::onSuggestUi()', /^void (?:\w+::)*AlternateDisplays::onSuggestUi\(\)$/, 'self-start: onSuggestUi'],
+    rs: ['AlternateDisplays::requestStream()', /^void (?:\w+::)*AlternateDisplays::requestStream\(\)$/, 'self-start: requestStream'],
     showUi: ['mCinemoCarPlay->ShowUI(', /^mCinemoCarPlay->ShowUI\(/, 'self-start: ShowUI'],
     keyframe: ['mCinemoCarPlay->ForceKeyframe(', /^mCinemoCarPlay->ForceKeyframe\(/, 'self-start: ForceKeyframe'],
-    ctor: ['ICSafeAreaProvider::ICSafeAreaProvider(', /^[\w:]*ICSafeAreaProvider::ICSafeAreaProvider\(/, 'resolution: ICSafeAreaProvider'],
+    ctor: ['ICSafeAreaProvider::ICSafeAreaProvider(', /^(?:\w+::)*ICSafeAreaProvider::ICSafeAreaProvider\(const (?:\w+::)*KombiVariant::Values&\)$/, 'resolution: ICSafeAreaProvider'],
 };
 
+/* The function loading `str` at its entry (its logging prologue): an inlined
+ * copy or a split-off part loads it deeper. */
+function entryFunc(im, refs, str, label) {
+    var f = funcOfString(im, refs, str, label);
+    if (f.err) return f;
+    return refs[str.off].some(function (p) { return p - f.off < ENTRY; }) ? f : { err: label + ' name not loaded at the function entry' };
+}
+
 /* setStreamStatus, requestStream and onSuggestUi by their own function-name
- * strings. requestStream must reference the ShowUI and ForceKeyframe checks
- * and call setStreamStatus. The site is onSuggestUi's one call to either,
- * with AVAILABLE (1) stored as its argument just before it. */
+ * strings, each loaded at its function's entry, the three within NEAR of each
+ * other. requestStream must reference the ShowUI and ForceKeyframe checks,
+ * call setStreamStatus, and be called directly from outside onSuggestUi (a
+ * function in its own right, not a callback that inlined it). The site is
+ * onSuggestUi's one call to either, with AVAILABLE (1) stored as its argument
+ * just before it. */
 function locateSelfstart(im, str, refs) {
     if (!im.starts.length) return { ok: false, reason: 'self-start: no function table' };
-    var ss = funcOfString(im, refs, str.ss, NAMES.ss[2]);
-    var rs = funcOfString(im, refs, str.rs, NAMES.rs[2]);
-    var osu = funcOfString(im, refs, str.osu, NAMES.osu[2]);
+    var ss = entryFunc(im, refs, str.ss, NAMES.ss[2]);
+    var rs = entryFunc(im, refs, str.rs, NAMES.rs[2]);
+    var osu = entryFunc(im, refs, str.osu, NAMES.osu[2]);
     var err = ss.err || rs.err || osu.err || str.showUi.err || str.keyframe.err;
     if (err) return { ok: false, reason: err };
+    if (Math.max(ss.off, rs.off, osu.off) - Math.min(ss.off, rs.off, osu.off) > NEAR)
+        return { ok: false, reason: 'self-start: AlternateDisplays functions far apart' };
+    if (!im.callers(rs.off).some(function (p) { return p < osu.off || p >= osu.end; }))
+        return { ok: false, reason: 'self-start: requestStream not called directly' };
     function inRs(o) { return refs[o].some(function (p) { return p >= rs.off && p < rs.end; }); }
     if (!inRs(str.showUi.off) || !inRs(str.keyframe.off)) return { ok: false, reason: 'self-start: requestStream lacks ShowUI/keyframe' };
     if (!im.calls(rs.off, rs.end).some(function (c) { return c.to === ss.off; }))
@@ -291,14 +363,54 @@ var STORES = [0x48, 0x89, 0x57, 0x10, 0x48, 0xb8].concat(any(8))
     .concat([0x48, 0x89, 0x47, 0x20, 0x48, 0xb8]).concat(any(8))
     .concat([0x48, 0x89, 0x47, 0x28]);
 
-/* A geometry builder at `f`: its four immediates' offsets, or null. */
+/* A geometry builder at `f`: a short function opening with `movabs rdx` (the
+ * mm pair) and holding the stores once; its four immediates' offsets, or
+ * null. */
 function builder(im, f) {
-    var fn = im.func(f);
-    if (!fn || fn.off !== f) return null;
-    var st = scan(im.buf, f, fn.end, STORES);
-    if (st.length !== 1) return null;
-    var mm = scan(im.buf, f, st[0] - 8, [0x48, 0xba]);
-    return mm.length === 1 ? { builder: f, mm: mm[0] + 2, px: st[0] + 6, safe1: st[0] + 24, safe2: st[0] + 38 } : null;
+    var fn = im.func(f), buf = im.buf;
+    if (!fn || fn.off !== f || fn.end - fn.off > 0x80 || buf[f] !== 0x48 || buf[f + 1] !== 0xba) return null;
+    var st = scan(buf, f, fn.end, STORES);
+    return st.length === 1 && st[0] > f + 10 ? { builder: f, mm: f + 2, px: st[0] + 6, safe1: st[0] + 24, safe2: st[0] + 38 } : null;
+}
+
+/* The getters the builders' fields are read through: the small functions a
+ * caller of the constructor calls after it, each reading one field of
+ * `this` (mov rax,[rdi+d8] / mov eax,[rdi+d8] / movzx eax,word [rdi+d8]).
+ * The edit writes pixel size (+0x18), view x,y (+0x20, +0x22), safe width
+ * and height (+0x24) and safe x,y (+0x2c, +0x2e): the getters some caller
+ * calls must read each of those, other fields besides, so the immediates
+ * mean what the edit writes. */
+var FIELDS = ['q18', 'w20', 'w22', 'q24', 'w2c', 'w2e'];
+function fieldRead(im, f) {
+    var fn = im.func(f), buf = im.buf, found = [];
+    if (!fn || fn.off !== f || fn.end - fn.off > 0x40) return null;
+    for (var p = f; p + 4 <= fn.end; p++) {
+        if (buf[p] === 0x48 && buf[p + 1] === 0x8b && buf[p + 2] === 0x47) found.push('q' + buf[p + 3].toString(16));
+        else if (buf[p] === 0x0f && buf[p + 1] === 0xb7 && buf[p + 2] === 0x47) found.push('w' + buf[p + 3].toString(16));
+        else if (buf[p] === 0x8b && buf[p + 1] === 0x47 && buf[p - 1] !== 0x48) found.push('d' + buf[p + 2].toString(16));
+    }
+    return found.length === 1 ? found[0] : null;
+}
+function layoutRead(im, ctor) {
+    return im.callers(ctor.off).some(function (at) {
+        var fn = im.func(at);
+        if (!fn) return false;
+        var got = im.calls(at + 5, Math.min(fn.end, at + 0x100)).map(function (c) { return fieldRead(im, c.to); })
+            .filter(function (r) { return r; });
+        return FIELDS.every(function (f) { return got.indexOf(f) >= 0; });
+    });
+}
+
+/* The variant check called at `c`: 'high' for `[rdi] == IC_HIGH`, 'mid' for
+ * `[rdi] == IC_MID`, small functions doing mov eax,[rdi] ; test eax,eax ;
+ * sete al (or cmp dword [rdi],0 ; sete al) and cmp dword [rdi],1 ; sete al. */
+function checkKind(im, to) {
+    var fn = im.func(to), buf = im.buf;
+    if (!fn || fn.off !== to || fn.end - fn.off > 128) return null;
+    if (scan(buf, fn.off, fn.end, [0x8b, 0x07, 0x85, 0xc0, 0x0f, 0x94, 0xc0]).length ||
+        scan(buf, fn.off, fn.end, [0x83, 0x3f, 0x00, 0x0f, 0x94, 0xc0]).length) return 'high';
+    if (scan(buf, fn.off, fn.end, [0x83, 0x3f, 0x01, 0x0f, 0x94, 0xc0]).length) return 'mid';
+    return null;
 }
 
 /* The start of the code run when the bool returned by the call at `at` is
@@ -316,28 +428,76 @@ function trueBranch(im, at, end) {
     return null;
 }
 
-/* The ICSafeAreaProvider constructor calls two geometry builders; the IC_HIGH
- * one is the builder called on the true branch of the constructor's call to
- * its `variant == IC_HIGH` check, a small function doing
- * mov eax,[rdi] ; test eax,eax ; sete al (or cmp dword [rdi],0 ; sete al). */
+/* The ICSafeAreaProvider constructor `(const KombiVariant::Values&)` calls
+ * two geometry builders within NEAR of it: the IC_HIGH one on the true branch
+ * of its one call to the `variant == IC_HIGH` check, the IC_MID one on the
+ * true branch of its one call to the `variant == IC_MID` check. A caller of
+ * the constructor reads the fields the edit writes through their getters. */
 function locateRes(im, str, refs) {
     if (!im.starts.length) return { ok: false, reason: 'resolution: no function table' };
     var ctor = funcOfString(im, refs, str.ctor, NAMES.ctor[2]);
     if (ctor.err) return { ok: false, reason: ctor.err };
-    var buf = im.buf, calls = im.calls(ctor.off, ctor.end), builders = {}, isHigh = [];
+    var calls = im.calls(ctor.off, ctor.end), builders = {}, checks = { high: [], mid: [] };
     calls.forEach(function (c) {
         if (builders[c.to] === undefined) builders[c.to] = builder(im, c.to);
-        var fn = im.func(c.to);
-        if (fn && fn.off === c.to && fn.end - fn.off <= 128 &&(scan(buf, fn.off, fn.end, [0x8b, 0x07, 0x85, 0xc0, 0x0f, 0x94, 0xc0]).length ||
-            scan(buf, fn.off, fn.end, [0x83, 0x3f, 0x00, 0x0f, 0x94, 0xc0]).length)) isHigh.push(c);
+        var k = checkKind(im, c.to);
+        if (k) checks[k].push(c);
     });
     var found = Object.keys(builders).filter(function (k) { return builders[k]; });
     if (found.length !== 2) return { ok: false, reason: 'resolution: ' + found.length + ' geometry builders (want 2)' };
-    if (isHigh.length !== 1) return { ok: false, reason: 'resolution: IC_HIGH check ' + (isHigh.length ? 'called ' + isHigh.length + ' times' : 'not found') };
-    var branch = trueBranch(im, isHigh[0].at, ctor.end);
-    var high = calls.filter(function (c) { return branch !== null && c.at >= branch && c.at < branch + 16 && builders[c.to]; })[0];
-    if (!high) return { ok: false, reason: 'resolution: IC_HIGH builder not found' };
-    return { ok: true, builder: high.to, mm: builders[high.to].mm, px: builders[high.to].px, safe1: builders[high.to].safe1, safe2: builders[high.to].safe2 };
+    function branchBuilder(kind) {
+        if (checks[kind].length !== 1) return { err: 'resolution: IC_' + kind.toUpperCase() + ' check ' + (checks[kind].length ? 'called ' + checks[kind].length + ' times' : 'not found') };
+        var branch = trueBranch(im, checks[kind][0].at, ctor.end);
+        var c = calls.filter(function (x) { return branch !== null && x.at >= branch && x.at < branch + 16 && builders[x.to]; })[0];
+        return c ? { to: c.to } : { err: 'resolution: IC_' + kind.toUpperCase() + ' builder not found' };
+    }
+    var high = branchBuilder('high'), mid = branchBuilder('mid');
+    if (high.err || mid.err) return { ok: false, reason: high.err || mid.err };
+    if (high.to === mid.to) return { ok: false, reason: 'resolution: IC_HIGH and IC_MID share a builder' };
+    if (Math.abs(high.to - ctor.off) > NEAR || Math.abs(mid.to - ctor.off) > NEAR) return { ok: false, reason: 'resolution: builders far from the constructor' };
+    if (!layoutRead(im, ctor)) return { ok: false, reason: 'resolution: geometry getters not found' };
+    var b = builders[high.to];
+    return { ok: true, builder: high.to, mm: b.mm, px: b.px, safe1: b.safe1, safe2: b.safe2 };
+}
+
+/* ---- relocations and version -------------------------------------------- */
+
+/* The edits the loader would rewrite: all of them with text relocations or
+ * relocations this cannot read (REL, RELR, or a dynamic segment or table
+ * outside the file), else
+ * those of `regions` ([edit, off, len]) that a relocation's 8 bytes (RELA or
+ * PLT) overlap. { all: why or null, edits } */
+function relocated(im, regions) {
+    var out = { all: null, edits: [] };
+    if (im.dynBad) { out.all = 'relocations not readable'; return out; }
+    if (!im.dyn) return out;
+    var buf = im.buf, d = {}, rel = [];
+    for (var o = im.dyn.off; o + 16 <= im.dyn.off + im.dyn.size; o += 16) {
+        var tag = u64(buf, o);
+        if (tag === 0) break;
+        if (tag !== null) d[tag] = u64(buf, o + 8);
+    }
+    if (d[22] !== undefined || (d[30] & 4)) { out.all = 'text relocations'; return out; }      /* DT_TEXTREL, DF_TEXTREL */
+    if (d[17] !== undefined || d[36] !== undefined) { out.all = 'relocations not readable'; return out; }   /* DT_REL, DT_RELR */
+    [[7, 8], [23, 2]].forEach(function (t) {                                  /* DT_RELA/RELASZ, DT_JMPREL/PLTRELSZ */
+        if (d[t[0]] === undefined) return;
+        var at = d[t[0]] === null ? null : im.off(d[t[0]]), n = d[t[1]] || 0;
+        if (at === null || at + n > buf.length) { out.all = 'relocations not readable'; return; }
+        for (var r = at; r + 24 <= at + n; r += 24) { var v = u64(buf, r); if (v !== null) rel.push(v); }
+    });
+    if (out.all) return out;
+    regions.forEach(function (g) {
+        var va = im.va(g[1]);
+        if (va !== null && rel.some(function (v) { return v + 8 > va && v < va + g[2]; }) && out.edits.indexOf(g[0]) < 0) out.edits.push(g[0]);
+    });
+    return out;
+}
+
+/* The carplay version its debug source paths name, or null. */
+function version(buf) {
+    var re = /\/usr\/src\/debug\/carplay\/([0-9][0-9.]*)\+/g, text = buf.toString('latin1'), m, seen = [];
+    while ((m = re.exec(text))) if (seen.indexOf(m[1]) < 0) seen.push(m[1]);
+    return seen.length === 1 ? seen[0] : null;
 }
 
 /* ---- Edit 5 (optional): the guidance-metadata forward call ---------------- */
@@ -360,12 +520,12 @@ function locateNavmd(im, anchor, trio) {
     if (!im.starts.length) return { ok: false, reason: 'navmd: no function table' };
     if (!anchor) return { ok: false, reason: 'navmd: no anchor given' };
     if (trio.err) return { ok: false, reason: 'navmd: ' + trio.err };
-    var sep = anchor.indexOf('/'), re = null;
+    var sep = anchor.indexOf('/'), re = null, key = sep < 0 ? anchor : anchor.slice(0, sep);
     if (sep >= 0) {
         try { re = new RegExp(anchor.slice(sep + 1)); }
         catch (e) { return { ok: false, reason: 'navmd: bad anchor regex: ' + e.message }; }
     }
-    var str = namedString(im.buf, sep < 0 ? anchor : anchor.slice(0, sep), re || /./, 'navmd: anchor');
+    var str = namedString(im.buf, key, re || /./, 'navmd: ' + key);
     if (str.err) return { ok: false, reason: str.err };
     var refs = leaRefs(im, [str.off]), sites = refs[str.off] || [];
     if (!sites.length) return { ok: false, reason: 'navmd: anchor string not referenced' };
@@ -402,7 +562,7 @@ function locateNavmd(im, anchor, trio) {
 }
 
 /* All four sites: { elf: true|false, reason (not an ELF / why), buildId,
- * variant, sink, selfstart, res }, each edit { ok, reason } plus its
+ * version, variant, sink, selfstart, res }, each edit { ok, reason } plus its
  * offsets and stock/patched values. ok is true when every edit was found.
  * With `navmdAnchor` (Edit 5), the result also carries `navmd`: an optional
  * edit that never takes part in ok — a build without the anchor string, or
@@ -410,24 +570,41 @@ function locateNavmd(im, anchor, trio) {
 function locate(buf, navmdAnchor) {
     var elf = parseElf(buf);
     var none = { ok: false, reason: 'not located' };
-    if (!elf.load) return { ok: false, elf: false, reason: elf.reason, buildId: null, variant: none, sink: none, selfstart: none, res: none };
-    var im = new Image(buf, elf), str = {}, offs = [];
+    if (!elf.load) return { ok: false, elf: false, reason: elf.reason, buildId: null, version: null, variant: none, sink: none, selfstart: none, res: none };
+    var im = new Image(buf, elf), str = {}, offs = [], sink = locateSink(buf);
     Object.keys(NAMES).forEach(function (k) {
         str[k] = namedString(buf, NAMES[k][0], NAMES[k][1], NAMES[k][2]);
         if (!str[k].err) offs.push(str[k].off);
     });
+    if (sink.ok) for (var i = 0; i < sink.len; i++) offs.push(sink.offset + i);
     var refs = leaRefs(im, offs);
     var selfstart = locateSelfstart(im, str, refs);
-    var out = { elf: true, buildId: buildId(buf, elf.notes), variant: locateVariant(im), sink: locateSink(buf),
+    var out = { elf: true, buildId: buildId(buf, elf.notes), version: version(buf), variant: locateVariant(im, str, refs), sink: sinkRefs(sink, refs),
                 selfstart: selfstart, res: locateRes(im, str, refs) };
-    if (navmdAnchor !== undefined && navmdAnchor !== '')
+    var regions = [];
+    if (out.variant.ok) regions.push(['variant', out.variant.slot, 4]);
+    if (out.sink.ok) regions.push(['sink', out.sink.offset, out.sink.len]);
+    if (out.selfstart.ok) regions.push(['selfstart', out.selfstart.offset, 5]);
+    if (out.res.ok) [out.res.mm, out.res.px, out.res.safe1, out.res.safe2].forEach(function (o) { regions.push(['res', o, 8]); });
+    var hit = relocated(im, regions), label = { variant: 'variant', sink: 'sink', selfstart: 'self-start', res: 'resolution' };
+    Object.keys(label).forEach(function (e) {
+        if (out[e].ok && (hit.all || hit.edits.indexOf(e) >= 0))
+            out[e] = { ok: false, reason: label[e] + ': ' + (hit.all || 'a dynamic relocation over the edit') };
+    });
+    if (navmdAnchor !== undefined && navmdAnchor !== '') {
         out.navmd = locateNavmd(im, navmdAnchor,
             selfstart.ok ? { list: [selfstart.setStreamStatus, selfstart.requestStream, selfstart.onSuggestUi] }
                          : { err: 'the video-path check needs the self-start sites' });
+        if (out.navmd.ok) {
+            var nhit = relocated(im, [['navmd', out.navmd.offset, 5]]);
+            if (nhit.all || nhit.edits.indexOf('navmd') >= 0)
+                out.navmd = { ok: false, reason: 'navmd: ' + (nhit.all || 'a dynamic relocation over the edit') };
+        }
+    }
     var failed = [out.variant, out.sink, out.selfstart, out.res].filter(function (e) { return !e.ok; });
     out.ok = failed.length === 0;
     if (failed.length) out.reason = failed.map(function (e) { return e.reason; }).join('; ');
     return out;
 }
 
-module.exports = { locate: locate, SINK_STOCK: SINK_STOCK };
+module.exports = { locate: locate, buildId: elfBuildId, SINK_STOCK: SINK_STOCK };

@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Robert Nisipeanu
+name: Build image
+description: >
+  The head unit's toolchain image (native/cluster-render/docker), loaded from
+  the Actions cache by its Dockerfile's checksum, or built and cached. Only
+  test runs use it: the Release workflow builds its own.
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: echo "key=build-image-$(cksum < native/cluster-render/docker/Dockerfile | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/build-image.tar
+        key: ${{ steps.key.outputs.key }}
+    - if: steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: docker load -q -i "$RUNNER_TEMP/build-image.tar"
+    # builds it when the cache had none (or one with another tag)
+    - id: image
+      shell: bash
+      run: echo "tag=$(make -s -C native/cluster-render image)" >> "$GITHUB_OUTPUT"
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        TAG: ${{ steps.image.outputs.tag }}
+      run: docker save "$TAG" -o "$RUNNER_TEMP/build-image.tar"
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/build-image.tar
+        key: ${{ steps.key.outputs.key }}

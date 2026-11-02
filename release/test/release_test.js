@@ -165,6 +165,13 @@ test('the Waze chain: app -> waze-on-cluster -> cluster-render and a hook-runnin
     assert.deepStrictEqual(c.activate, ['node', 'patchd.js', 'activate']);
     assert.deepStrictEqual(c.deactivate, ['node', 'patchd.js', 'deactivate']);
     assert.ok(c.files.some((f) => f.path === 'patchd.js'), 'the hook ships');
+    // recmgr: a CarPlay crash and the boot step's timeout do not reboot the unit;
+    // neither is started or restarted by the deploy tool
+    assert.ok(c.recmgr.includes('carplay') && c.recmgr.includes('waze-on-cluster-boot'));
+    assert.ok(!c.restart.some((u) => /^(carplay|waze-on-cluster-boot)\.service$/.test(u)));
+    // the shutdown record's drop-in, removed with the tool
+    assert.deepStrictEqual(c.dropins.map((d) => [d.unit, d.name]), [['var-opt-ro.service', '50-waze-on-cluster.conf']]);
+    assert.ok(fs.existsSync(path.join(__dirname, '..', '..', 'native', 'waze-on-cluster', c.dropins[0].from)));
     assert.deepStrictEqual(renderer.mguHmi, ['ID7', 'ID8'], 'the renderer serves iDrive 8 too');
     // the Store removes the app, then the tool, then the renderer
     assert.strictEqual(app.uninstallable, true);

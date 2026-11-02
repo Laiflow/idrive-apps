@@ -31,7 +31,12 @@ CXX     ?= c++
 NODE    ?= node
 PYTHON  ?= python3
 BUILD   ?= build
-IMAGE    = cluster-render-build        # the unit's toolchain ABI (docker/Dockerfile)
+JOBS    ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)   # parallel compiles
+
+# The unit's toolchain ABI (docker/Dockerfile), tagged with the Dockerfile's
+# checksum: built when no image has that tag.
+IMAGE   := cluster-render-build:$(shell cksum < docker/Dockerfile | cut -d' ' -f1)
+DOCKER_IMAGE = docker image inspect $(IMAGE) >/dev/null 2>&1 || docker build -q --platform linux/amd64 -t $(IMAGE) docker
 
 CXXFLAGS = -std=c++14 -O2 -g -Wall -Wextra -Werror
 HOSTINC  = -Ikit -Iinclude -I. -Isrc -isystem dcsm/third_party/vsomeip/interface
@@ -57,14 +62,21 @@ UNIT8_SRC = src/main.cpp src/unit_idrive8.cpp src/graph_ramses27.cpp src/config.
 LAUNCH_SRC = src/main.cpp src/launch.cpp src/generation.cpp src/config.cpp client/protocol.cpp src/log.cpp
 CLIENT_SRC = client/client.cpp client/protocol.cpp
 
-.PHONY: all test test-cpp test-js test-kit test-x86 test-kit-x86 target target-in-docker test-ramses test-ramses27 clean
+.PHONY: all test test-cpp test-js test-kit test-kit-bin test-x86 test-x86-in-docker test-kit-x86 image target target-in-docker \
+	test-ramses test-ramses27 clean
+
+KIT_TESTS = $(H)/map_upload_test $(H)/yuv_atlas_test $(H)/frame_clock_test $(H)/block_pack_test
+CPP_TESTS = $(H)/log_test $(H)/slots_test $(H)/governor_test $(H)/compositor_test $(H)/service_test \
+	$(H)/dcsm2_port_test $(H)/ramses_console_test $(H)/dcsm27_port_test $(H)/generation_test
 
 all: test
 
-test: test-kit test-cpp test-js
+# The test binaries build in parallel; the tests run one at a time.
+test:
+	$(MAKE) -j$(JOBS) $(KIT_TESTS) $(CPP_TESTS) $(H)/host_service
+	$(MAKE) -j1 test-kit test-cpp test-js
 
-test-cpp: $(H)/log_test $(H)/slots_test $(H)/governor_test $(H)/compositor_test $(H)/service_test $(H)/dcsm2_port_test \
-		$(H)/ramses_console_test $(H)/dcsm27_port_test $(H)/generation_test
+test-cpp: $(CPP_TESTS)
 	$(H)/log_test
 	$(H)/slots_test
 	$(H)/ramses_console_test
@@ -78,91 +90,100 @@ test-cpp: $(H)/log_test $(H)/slots_test $(H)/governor_test $(H)/compositor_test 
 test-js: $(H)/host_service
 	$(NODE) js/test/client_test.js $(H)/host_service
 
-test-kit: $(H)/map_upload_test $(H)/yuv_atlas_test $(H)/frame_clock_test $(H)/block_pack_test
+test-kit-bin: $(KIT_TESTS)
+
+test-kit: $(KIT_TESTS)
 	$(H)/map_upload_test
 	$(H)/yuv_atlas_test
 	$(H)/frame_clock_test
 	$(H)/block_pack_test
 
 test-x86:
-	docker build -q --platform linux/amd64 -t $(IMAGE) docker
+	$(DOCKER_IMAGE)
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w/cluster-render" -w /w/cluster-render $(IMAGE) \
-		make -s BUILD=$(BUILD)/x86 CXX=g++ test-kit test-cpp
+		make -s BUILD=$(BUILD)/x86 CXX=g++ JOBS=$(JOBS) test-x86-in-docker
+
+test-x86-in-docker:
+	$(MAKE) -j$(JOBS) $(KIT_TESTS) $(CPP_TESTS)
+	$(MAKE) -j1 test-kit test-cpp
 
 test-kit-x86:
-	docker build -q --platform linux/amd64 -t $(IMAGE) docker
+	$(DOCKER_IMAGE)
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w/cluster-render" -w /w/cluster-render $(IMAGE) \
 		make -s BUILD=$(BUILD)/x86 CXX=g++ test-kit
 
 # ---- host tests -------------------------------------------------------------
-$(H)/log_test: test/log_test.cpp src/log.cpp src/log.h
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/log_test.cpp src/log.cpp -lpthread
+# Each source compiles once into $(H)/obj (the service's include path) and
+# $(H)/kitobj (the kit's alone: producers build it without the service), with
+# its header dependencies; the test binaries link the objects they need.
+O  = $(H)/obj
+KO = $(H)/kitobj
+CORE_OBJ = $(addprefix $(O)/,$(CORE_SRC:.cpp=.o) $(KIT_SRC:.cpp=.o))
 
-$(H)/slots_test: test/slots_test.cpp src/slots.cpp src/slots.h src/governor.cpp src/governor.h src/log.cpp
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/slots_test.cpp src/slots.cpp src/governor.cpp src/log.cpp -lpthread
+$(O)/%.o: %.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(HOSTINC) -MMD -MP -c -o $@ $<
 
-$(H)/ramses_console_test: test/ramses_console_test.cpp src/ramses_console.cpp src/ramses_console.h src/log.cpp
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/ramses_console_test.cpp src/ramses_console.cpp src/log.cpp -lpthread
+$(KO)/%.o: %.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -Ikit -MMD -MP -c -o $@ $<
 
-$(H)/governor_test: test/governor_test.cpp src/governor.cpp src/governor.h src/log.cpp
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/governor_test.cpp src/governor.cpp src/log.cpp -lpthread
+-include $(wildcard $(O)/*/*.d $(KO)/*/*.d)
 
-$(H)/compositor_test: test/compositor_test.cpp test/fake_graph.h $(CORE_SRC) $(KIT_SRC) $(CORE_H)
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/compositor_test.cpp $(CORE_SRC) $(KIT_SRC) -lpthread
+$(H)/log_test: $(O)/test/log_test.o $(O)/src/log.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/dcsm2_port_test: test/dcsm2_port_test.cpp src/dcsm2_port.cpp src/slots.cpp src/governor.cpp src/log.cpp \
-		$(CORE_H)
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/dcsm2_port_test.cpp src/dcsm2_port.cpp src/slots.cpp src/governor.cpp \
-		src/log.cpp -lpthread
+$(H)/slots_test: $(O)/test/slots_test.o $(O)/src/slots.o $(O)/src/governor.o $(O)/src/log.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/dcsm27_port_test: test/dcsm27_port_test.cpp src/dcsm27_port.cpp src/slots.cpp src/governor.cpp src/log.cpp \
-		$(CORE_H)
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/dcsm27_port_test.cpp src/dcsm27_port.cpp src/slots.cpp src/governor.cpp \
-		src/log.cpp -lpthread
+$(H)/ramses_console_test: $(O)/test/ramses_console_test.o $(O)/src/ramses_console.o $(O)/src/log.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/generation_test: test/generation_test.cpp src/generation.cpp src/generation.h
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/generation_test.cpp src/generation.cpp
+$(H)/governor_test: $(O)/test/governor_test.o $(O)/src/governor.o $(O)/src/log.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/service_test: test/service_test.cpp test/fake_graph.h test/fake_port.h $(CORE_SRC) $(KIT_SRC) client/client.cpp \
-		$(CORE_H)
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/service_test.cpp $(CORE_SRC) $(KIT_SRC) client/client.cpp -lpthread
+$(H)/compositor_test: $(O)/test/compositor_test.o $(CORE_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/host_service: test/host_service.cpp test/fake_graph.h test/fake_port.h $(CORE_SRC) $(KIT_SRC) $(CORE_H)
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(HOSTINC) -o $@ test/host_service.cpp $(CORE_SRC) $(KIT_SRC) -lpthread
+$(H)/dcsm2_port_test: $(O)/test/dcsm2_port_test.o $(O)/src/dcsm2_port.o $(O)/src/slots.o $(O)/src/governor.o \
+		$(O)/src/log.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/map_upload_test: test/map_upload_test.cpp kit/map_geometry.cpp kit/map_geometry.h \
-		kit/dirty_tiles.cpp kit/dirty_tiles.h kit/upload_pacer.h
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -Ikit -o $@ test/map_upload_test.cpp kit/map_geometry.cpp kit/dirty_tiles.cpp
+$(H)/dcsm27_port_test: $(O)/test/dcsm27_port_test.o $(O)/src/dcsm27_port.o $(O)/src/slots.o $(O)/src/governor.o \
+		$(O)/src/log.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/yuv_atlas_test: test/yuv_atlas_test.cpp kit/yuv_atlas.cpp kit/yuv_atlas.h
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -Ikit -o $@ test/yuv_atlas_test.cpp kit/yuv_atlas.cpp
+$(H)/generation_test: $(O)/test/generation_test.o $(O)/src/generation.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
-$(H)/block_pack_test: test/block_pack_test.cpp kit/block_pack.cpp kit/block_pack.h kit/yuv_atlas.cpp \
-		kit/yuv_atlas.h
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -Ikit -o $@ test/block_pack_test.cpp kit/block_pack.cpp kit/yuv_atlas.cpp -lpthread
+$(H)/service_test: $(O)/test/service_test.o $(CORE_OBJ) $(O)/client/client.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
-$(H)/frame_clock_test: test/frame_clock_test.cpp kit/frame_clock.h
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -Ikit -o $@ test/frame_clock_test.cpp
+$(H)/host_service: $(O)/test/host_service.o $(CORE_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+
+$(H)/map_upload_test: $(KO)/test/map_upload_test.o $(KO)/kit/map_geometry.o $(KO)/kit/dirty_tiles.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+$(H)/yuv_atlas_test: $(KO)/test/yuv_atlas_test.o $(KO)/kit/yuv_atlas.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+$(H)/block_pack_test: $(KO)/test/block_pack_test.o $(KO)/kit/block_pack.o $(KO)/kit/yuv_atlas.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
+
+$(H)/frame_clock_test: $(KO)/test/frame_clock_test.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
 # ---- target binary (in Docker) ----------------------------------------------
+# The build image, built when missing; prints its tag.
+image:
+	@$(DOCKER_IMAGE) >/dev/null
+	@echo $(IMAGE)
+
 target:
-	docker build -q --platform linux/amd64 -t $(IMAGE) docker
+	$(DOCKER_IMAGE)
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w/cluster-render" -w /w/cluster-render $(IMAGE) \
-		make -s BUILD=$(BUILD) target-in-docker
+		make -s -j$(JOBS) BUILD=$(BUILD) target-in-docker
 
 target-in-docker: $(T)/cluster-render $(T)/cluster-render-idrive7 $(T)/cluster-render-idrive8 \
 	$(T)/libcluster_render_client.a
@@ -184,28 +205,48 @@ $(T)/stub/libvsomeip3.so.3: dcsm/abi/libvsomeip3.so.3.symbols
 
 STUBS = $(T)/stub/$(RAMSES_SONAME) $(T)/stub/libvsomeip3.so.3
 
+# Each binary's sources compile in a folder of their own, with that binary's
+# flags and their header dependencies (-MD: the -isystem RAMSES and vsomeip
+# headers too).
+LAUNCH_FLAGS  = $(CXXFLAGS) $(HOSTINC) -pthread
+IDRIVE7_FLAGS = $(CXXFLAGS) $(CPPFLAGS) -DCR_VERSION='"$(VERSION)"' -pthread
+IDRIVE8_FLAGS = $(CXXFLAGS) $(CPPFLAGS27) -DCR_VERSION='"$(VERSION)"' -pthread
+LD_UNIT       = -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2
+
+$(T)/launch/%.o: %.cpp
+	@mkdir -p $(@D)
+	g++ $(LAUNCH_FLAGS) -MD -MP -c -o $@ $<
+
+$(T)/idrive7/%.o: %.cpp component.json
+	@mkdir -p $(@D)
+	g++ $(IDRIVE7_FLAGS) -MD -MP -c -o $@ $<
+
+$(T)/idrive8/%.o: %.cpp component.json
+	@mkdir -p $(@D)
+	g++ $(IDRIVE8_FLAGS) -MD -MP -c -o $@ $<
+
+-include $(wildcard $(T)/launch/*/*.d $(T)/idrive7/*/*.d $(T)/idrive8/*/*.d)
+
 # Starts the service of the unit's generation (src/unit.h): needs neither
 # libramses.
-$(T)/cluster-render: $(LAUNCH_SRC) $(CORE_H)
-	mkdir -p $(@D)
-	g++ $(CXXFLAGS) $(HOSTINC) -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2 -pthread -o $@ $(LAUNCH_SRC)
+$(T)/cluster-render: $(addprefix $(T)/launch/,$(LAUNCH_SRC:.cpp=.o))
+	g++ $(LAUNCH_FLAGS) $(LD_UNIT) -o $@ $^
 	$(PYTHON) tools/ramses_abi.py check-imports $@ abi/libramses19.symbols
 
-$(T)/cluster-render-idrive7: $(CORE_SRC) $(KIT_SRC) $(UNIT_SRC) $(CORE_H) $(STUBS) component.json
-	g++ $(CXXFLAGS) $(CPPFLAGS) -DCR_VERSION='"$(VERSION)"' -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2 -pthread \
-		-o $@ $(CORE_SRC) $(KIT_SRC) $(UNIT_SRC) $(STUBS)
+$(T)/cluster-render-idrive7: $(addprefix $(T)/idrive7/,$(CORE_SRC:.cpp=.o) $(KIT_SRC:.cpp=.o) $(UNIT_SRC:.cpp=.o)) $(STUBS)
+	g++ $(IDRIVE7_FLAGS) $(LD_UNIT) -o $@ $^
 	$(PYTHON) tools/ramses_abi.py check-imports $@ abi/libramses19.symbols
 	$(PYTHON) dcsm/tools/abi.py check $@ dcsm/abi/libvsomeip3.so.3.symbols
 
-$(T)/cluster-render-idrive8: $(CORE_SRC) $(KIT_SRC) $(UNIT8_SRC) $(CORE_H) $(T)/stub/$(RAMSES27_SONAME) component.json
-	g++ $(CXXFLAGS) $(CPPFLAGS27) -DCR_VERSION='"$(VERSION)"' -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2 -pthread \
-		-o $@ $(CORE_SRC) $(KIT_SRC) $(UNIT8_SRC) $(T)/stub/$(RAMSES27_SONAME)
+$(T)/cluster-render-idrive8: $(addprefix $(T)/idrive8/,$(CORE_SRC:.cpp=.o) $(KIT_SRC:.cpp=.o) $(UNIT8_SRC:.cpp=.o)) \
+		$(T)/stub/$(RAMSES27_SONAME)
+	g++ $(IDRIVE8_FLAGS) $(LD_UNIT) -o $@ $^
 	$(PYTHON) tools/ramses_abi.py check-imports $@ abi/libramses27.symbols
 
 # Every layer kind on the unit's own libramses (TCP, no renderer).
 test-ramses:
 	@test -n "$(ROOTFS)" || { echo "set ROOTFS to a copy of the unit's root filesystem"; exit 2; }
-	docker build -q --platform linux/amd64 -t $(IMAGE) docker
+	$(DOCKER_IMAGE)
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w/cluster-render" \
 		-v "$(ROOTFS):/rootfs:ro" -w /w/cluster-render $(IMAGE) \
 		sh -c 'make -s BUILD=$(BUILD) $(T)/ramses_check && \
@@ -221,7 +262,7 @@ $(T)/ramses_check: test/ramses_check.cpp test/fake_port.h src/graph_ramses19.cpp
 # The same on iDrive 8's libramses 27 (TCP, no renderer).
 test-ramses27:
 	@test -n "$(ROOTFS)" || { echo "set ROOTFS to a copy of an iDrive 8 unit's root filesystem"; exit 2; }
-	docker build -q --platform linux/amd64 -t $(IMAGE) docker
+	$(DOCKER_IMAGE)
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w/cluster-render" \
 		-v "$(ROOTFS):/rootfs:ro" -w /w/cluster-render $(IMAGE) \
 		sh -c 'make -s BUILD=$(BUILD) $(T)/ramses_check27 && \

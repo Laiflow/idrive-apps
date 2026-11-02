@@ -12,6 +12,7 @@
  * rate, and how many whole and partial writes the default budget lets
  * through a second. */
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -178,19 +179,31 @@ static void test_plan()
     ok("the packed partial tile lands where it belongs", got.px == e.px);
 }
 
+/* xorshift64: random bytes eight at a time, for whole frames of noise. */
+static uint64_t xorshift(uint64_t *s)
+{
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    return *s;
+}
+
 /* Random edits of random sizes, both formats: the plan written over the
  * previous frame always gives the new frame, and leaves alone every pixel it
  * does not cover. */
 static void test_random()
 {
     std::srand(12345);
+    uint64_t xs = 88172645463325252ull;
     bool all = true;
     for (int iter = 0; iter < 200 && all; iter++) {
         const uint32_t bpp = iter % 3 == 0 ? 1 : iter % 3 == 1 ? 3 : 4;   /* 1: the atlas */
         const uint32_t w = 1088, h = 480;
         Frame prev(w, h, bpp);
-        for (uint8_t &v : prev.px)
-            v = (uint8_t)std::rand();
+        for (size_t k = 0; k < prev.px.size(); k += 8) {
+            const uint64_t r = xorshift(&xs);
+            std::memcpy(&prev.px[k], &r, std::min<size_t>(8, prev.px.size() - k));
+        }
         Frame cur = prev;
         const int edits = std::rand() % 12;
         for (int i = 0; i < edits; i++) {
@@ -198,7 +211,7 @@ static void test_random()
             const uint32_t ew = 1 + std::rand() % (iter % 7 == 0 ? w : 90), eh = 1 + std::rand() % (iter % 7 == 0 ? h : 90);
             for (uint32_t yy = y; yy < y + eh && yy < h; yy++)
                 for (uint32_t xx = x; xx < x + ew && xx < w; xx++)
-                    cur.at(xx, yy)[std::rand() % bpp] ^= 0x5a;
+                    cur.at(xx, yy)[xorshift(&xs) % bpp] ^= 0x5a;
         }
         UploadPlan p = plan_upload(prev.px.data(), cur.px.data(), w, h, bpp, kTileSize, kTileSize);
         Frame tex = prev;

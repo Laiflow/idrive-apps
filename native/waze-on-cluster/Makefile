@@ -27,10 +27,14 @@ CXX     ?= c++
 NODE    ?= node
 PYTHON  ?= python3
 BUILD   ?= build
-IMAGE    = cluster-render-build        # the unit's toolchain ABI
+JOBS    ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)   # parallel compiles
 
 CR      ?= ../cluster-render
 KIT      = $(CR)/kit
+# the unit's toolchain ABI: the shared renderer's build image, by the same tag
+IMAGE   := cluster-render-build:$(shell cksum < $(CR)/docker/Dockerfile | cut -d' ' -f1)
+DOCKER_IMAGE = docker image inspect $(IMAGE) >/dev/null 2>&1 || \
+	docker build -q --platform linux/amd64 -t $(IMAGE) $(CR)/docker
 CXXFLAGS = -std=c++14 -O2 -g -Wall -Wextra -Werror
 CPPFLAGS = -I. -Isrc -I$(KIT) -I$(CR)/include -Iabi/include -I$(CR)/src
 
@@ -48,25 +52,36 @@ WOC_SRC = src/main.cpp src/video_producer.cpp src/freeze_watch.cpp src/alt_scree
 CR_SRC  = $(CR)/client/client.cpp $(CR)/client/protocol.cpp
 SRC     = $(WOC_SRC) $(CR_SRC) $(CR)/src/config.cpp $(CR)/src/log.cpp
 
-.PHONY: all test test-cpp test-x86 test-firmware target target-in-docker clean
+.PHONY: all test test-bin test-cpp test-node test-x86 test-x86-in-docker test-firmware target target-in-docker clean
+
+CPP_TESTS = $(BUILD)/host/nal_reader_test $(BUILD)/host/rtp_h264_test $(BUILD)/host/udp_probe_test \
+		$(BUILD)/host/map_feed_test $(BUILD)/host/keyframe_wait_test $(BUILD)/host/freeze_watch_test \
+		$(BUILD)/host/alt_screen_test $(BUILD)/host/packet_queue_test $(BUILD)/host/backlog_test \
+		$(BUILD)/host/stream_health_test
 
 all: test
 
 # ---- host tests (no unit libraries) ---------------------------------------
-test: test-cpp
+# The test binaries build in parallel; the tests run one at a time.
+test:
+	$(MAKE) -j$(JOBS) test-bin
+	$(MAKE) -j1 test-cpp test-node
+
+test-bin: $(CPP_TESTS)
+	$(MAKE) -C $(CR) test-kit-bin BUILD=$(abspath $(BUILD))/kit
+
+test-node:
 	$(NODE) patch/test/locate_test.js
+	$(NODE) patch/test/mutation_test.js
+	$(NODE) patch/test/undo_test.js
 	$(NODE) patch/test/patch_test.js
 	$(NODE) patch/test/patchd_patch_test.js
 	$(NODE) patch/test/patchd_activate_test.js
-	$(NODE) patch/test/patchd_resync_test.js
 	$(NODE) patch/test/patchd_dlt_test.js
 	$(NODE) patch/test/dlt_capture_test.js
 	$(NODE) patch/test/recovery_test.js
 
-test-cpp: $(BUILD)/host/nal_reader_test $(BUILD)/host/rtp_h264_test $(BUILD)/host/udp_probe_test \
-		$(BUILD)/host/map_feed_test $(BUILD)/host/keyframe_wait_test $(BUILD)/host/freeze_watch_test \
-		$(BUILD)/host/alt_screen_test $(BUILD)/host/packet_queue_test $(BUILD)/host/backlog_test \
-		$(BUILD)/host/stream_health_test
+test-cpp: $(CPP_TESTS)
 	$(BUILD)/host/nal_reader_test
 	$(BUILD)/host/rtp_h264_test test/data/stream15_start.rtp
 	$(BUILD)/host/udp_probe_test
@@ -80,9 +95,13 @@ test-cpp: $(BUILD)/host/nal_reader_test $(BUILD)/host/rtp_h264_test $(BUILD)/hos
 	$(MAKE) -C $(CR) test-kit BUILD=$(abspath $(BUILD))/kit
 
 test-x86:
-	docker build -q --platform linux/amd64 -t $(IMAGE) $(CR)/docker
+	$(DOCKER_IMAGE)
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w" -v "$(abspath $(CR)):/cr" -w /w $(IMAGE) \
-		make -s BUILD=$(BUILD)/x86 CR=/cr CXX=g++ test-cpp
+		make -s BUILD=$(BUILD)/x86 CR=/cr CXX=g++ JOBS=$(JOBS) test-x86-in-docker
+
+test-x86-in-docker:
+	$(MAKE) -j$(JOBS) test-bin
+	$(MAKE) -j1 test-cpp
 
 test-firmware:
 	@test -n "$(ROOTFS)" || { echo "set ROOTFS (a copy of the unit's root file system)"; exit 2; }
@@ -102,17 +121,32 @@ $(BUILD)/host/udp_probe_test: test/udp_probe_test.cpp src/udp_source.cpp src/udp
 	$(CXX) $(CXXFLAGS) -Isrc -I$(CR)/src -o $@ test/udp_probe_test.cpp src/udp_source.cpp src/framing_probe.cpp $(CR)/src/log.cpp -lpthread
 
 # The map feed against the shared renderer's service on fake display
-# backends, over its socket: every service source but the units' backends,
-# the starter and its main.
+# backends, over its socket, with the freeze watch driving it: every service
+# source but the units' backends, the starter and its main.
 CR_CORE = $(filter-out $(addprefix $(CR)/src/,main.cpp graph_ramses19.cpp dcsm2_link.cpp config.cpp log.cpp \
                          unit_idrive7.cpp unit_idrive8.cpp graph_ramses27.cpp launch.cpp generation.cpp), \
           $(wildcard $(CR)/src/*.cpp)) $(wildcard $(KIT)/*.cpp)
-$(BUILD)/host/map_feed_test: test/map_feed_test.cpp src/map_feed.cpp src/map_feed.h $(CR_CORE) $(CR_SRC) \
-		$(CR)/src/log.cpp $(wildcard $(CR)/src/*.h $(CR)/include/cluster_render/*.h $(CR)/test/*.h)
-	mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -Isrc -I$(KIT) -I$(CR)/include -I$(CR) -I$(CR)/src -isystem $(CR)/dcsm/third_party/vsomeip/interface \
-		-o $@ test/map_feed_test.cpp src/map_feed.cpp $(filter-out $(CR)/client/protocol.cpp,$(CR_CORE)) $(CR_SRC) \
-		$(CR)/src/log.cpp -lpthread
+# Each of its sources compiles once, with its header dependencies.
+MF       = $(BUILD)/host/map_feed
+MF_FLAGS = $(CXXFLAGS) -Isrc -I$(KIT) -I$(CR)/include -I$(CR) -I$(CR)/src -isystem $(CR)/dcsm/third_party/vsomeip/interface
+MF_SRC   = test/map_feed_test.cpp src/map_feed.cpp src/freeze_watch.cpp $(filter-out $(CR)/client/protocol.cpp,$(CR_CORE)) $(CR_SRC) \
+           $(CR)/src/log.cpp
+
+# objects of sources in this tree under <dir>/, of the shared renderer's under <dir>/cr/
+objs = $(foreach s,$(1),$(if $(filter $(CR)/%,$(s)),$(patsubst $(CR)/%.cpp,$(2)/cr/%.o,$(s)),$(patsubst %.cpp,$(2)/%.o,$(s))))
+
+$(MF)/cr/%.o: $(CR)/%.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(MF_FLAGS) -MMD -MP -c -o $@ $<
+
+$(MF)/%.o: %.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(MF_FLAGS) -MMD -MP -c -o $@ $<
+
+-include $(wildcard $(MF)/*/*.d $(MF)/cr/*/*.d)
+
+$(BUILD)/host/map_feed_test: $(call objs,$(MF_SRC),$(MF))
+	$(CXX) $(CXXFLAGS) -o $@ $^ -lpthread
 
 $(BUILD)/host/keyframe_wait_test: test/keyframe_wait_test.cpp src/keyframe_wait.h
 	mkdir -p $(@D)
@@ -140,9 +174,9 @@ $(BUILD)/host/stream_health_test: test/stream_health_test.cpp src/stream_health.
 
 # ---- target binary (in Docker) --------------------------------------------
 target:
-	docker build -q --platform linux/amd64 -t $(IMAGE) $(CR)/docker
+	$(DOCKER_IMAGE)
 	docker run --rm --platform linux/amd64 --user "$$(id -u):$$(id -g)" -v "$(CURDIR):/w" -v "$(abspath $(CR)):/cr" -w /w $(IMAGE) \
-		make -s BUILD=$(BUILD) CR=/cr target-in-docker
+		make -s -j$(JOBS) BUILD=$(BUILD) CR=/cr target-in-docker
 
 target-in-docker: $(T)/waze-on-cluster
 
@@ -171,9 +205,21 @@ $(T)/stub/libias-media_transport-avb_ufipc_bridge.so.1: abi/libias_avb.symbols
 STUBS = $(T)/stub/libmfxhw64.so $(T)/stub/libva.so.1 $(T)/stub/libva-drm.so.1 \
         $(T)/stub/libias-media_transport-avb_ufipc_bridge.so.1
 
-$(T)/waze-on-cluster: $(SRC) $(STUBS) component.json
-	g++ $(CXXFLAGS) $(CPPFLAGS) -DWOC_VERSION='"$(VERSION)"' -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2 -pthread \
-		-o $@ $(SRC) $(STUBS)
+# Each source compiles once, in parallel, with its header dependencies.
+WOC_FLAGS = $(CXXFLAGS) $(CPPFLAGS) -DWOC_VERSION='"$(VERSION)"' -pthread
+
+$(T)/obj/cr/%.o: $(CR)/%.cpp component.json
+	@mkdir -p $(@D)
+	g++ $(WOC_FLAGS) -MD -MP -c -o $@ $<
+
+$(T)/obj/%.o: %.cpp component.json
+	@mkdir -p $(@D)
+	g++ $(WOC_FLAGS) -MD -MP -c -o $@ $<
+
+-include $(wildcard $(T)/obj/*/*.d $(T)/obj/cr/*/*.d)
+
+$(T)/waze-on-cluster: $(call objs,$(SRC),$(T)/obj) $(STUBS)
+	g++ $(WOC_FLAGS) -Wl,--dynamic-linker=/lib/ld-linux-x86-64.so.2 -o $@ $^
 	$(PYTHON) $(CR)/dcsm/tools/abi.py check $@ $(CR)/dcsm/abi/libvsomeip3.so.3.symbols   # loader, glibc/libstdc++ limits
 	$(PYTHON) tools/woc_abi.py check-imports $@ --prefix MFX va ias_ -- \
 		abi/libmfx.symbols abi/libva.symbols abi/libva-drm.symbols abi/libias_avb.symbols

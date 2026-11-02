@@ -6,9 +6,9 @@
  * step, then waits out the cooldown; it stops at the 2000 KB/s floor; healthy
  * upload raises it one step a minute, idle time neither counting nor
  * resetting, any evidence resetting; a step down soon after a step up
- * doubles the wait for the next one, and a settled period restores it;
- * evidence with no upload going is not counted; the reason names the
- * evidence. */
+ * doubles the wait for the next one, and a settled period restores it; a
+ * step down a removal took holds the cap 10 min; evidence with no upload
+ * going is not counted; the reason names the evidence. */
 #include <cstdio>
 #include <string>
 
@@ -42,6 +42,12 @@ struct Rig {
         }
     }
     uint64_t kb() const { return g.cap() / KB; }
+    /* Two heartbeat silences at once: a step down that holds nothing. */
+    void stall()
+    {
+        g.evidence(Evidence::LinkStall, now);
+        g.evidence(Evidence::LinkStall, now);
+    }
 };
 
 static void no_single_error()
@@ -63,7 +69,7 @@ static void removal_steps_down()
     r.g.evidence(Evidence::Removal, r.now, "map: taken: fetch removed");
     r.run(100, true);
     ok("one removal while writes go: one step down at once, to 5000", r.kb() == 5000);
-    ok("the reason names it", r.g.reason() == "lowered from 5500 KB/s: in 30 s, 1 x scene removed");
+    ok("the reason names it and the hold", r.g.reason() == "lowered from 5500 KB/s: in 30 s, 1 x scene removed; held 10 min");
     r.g.evidence(Evidence::Removal, r.now);
     r.run(14000, true);
     ok("another within the 15 s cooldown waits for it", r.kb() == 5000);
@@ -123,9 +129,9 @@ static void floor()
 static void recovery()
 {
     Rig r;
-    r.g.evidence(Evidence::Removal, r.now);
+    r.stall();
     r.run(100, true);
-    r.g.evidence(Evidence::Removal, r.now);
+    r.stall();
     r.run(15100, true);
     ok("stepped down twice", r.kb() == 4500);
     /* A step down starts the window empty: the healthy time counts from it. */
@@ -145,11 +151,11 @@ static void recovery()
 static void evidence_resets_health()
 {
     Rig r;
-    r.g.evidence(Evidence::Removal, r.now);
+    r.stall();
     r.run(100, true);
     r.run(70000, true);
     ok("recovered once", r.kb() == 5500);
-    r.g.evidence(Evidence::Removal, r.now);
+    r.stall();
     r.run(100, true);
     r.run(30100, true);   /* the window empties */
     r.run(40000, true);
@@ -161,11 +167,11 @@ static void evidence_resets_health()
 static void probation()
 {
     Rig r;
-    r.g.evidence(Evidence::Removal, r.now);
+    r.stall();
     r.run(100, true);
     r.run(30000 + 60000 + 200, true);
     ok("stepped down and back up", r.kb() == 5500 && r.g.recover_ms() == 60000);
-    r.g.evidence(Evidence::Removal, r.now);
+    r.stall();
     r.run(100, true);
     ok("the raised level failing within a minute doubles the wait to 120 s",
        r.kb() == 5000 && r.g.recover_ms() == 120000);
@@ -175,6 +181,33 @@ static void probation()
     ok("but after 120 s", r.kb() == 5500);
     r.run(600000, true);
     ok("ten minutes with no step down restores the 60 s wait", r.g.recover_ms() == 60000);
+}
+
+static void removal_holds()
+{
+    Rig r;
+    r.g.evidence(Evidence::Removal, r.now);
+    r.run(100, true);
+    r.run(9 * 60000, true);
+    ok("a removal's step down: no step up for 9 min of healthy upload", r.kb() == 5000);
+    r.run(60000, true);
+    ok("one step up once 10 min have passed", r.kb() == 5500);
+    Rig s;
+    s.stall();
+    s.run(100, true);
+    s.run(61000, true);
+    ok("a step down without a removal: up after a minute", s.kb() == 5500);
+    Rig f;
+    for (int i = 0; i < 7; i++) {
+        f.stall();
+        f.run(16000, true);
+    }
+    const bool at_floor = f.kb() == 2000;
+    f.g.evidence(Evidence::Removal, f.now);
+    f.run(100, true);
+    const bool said = f.g.reason().find("at the floor") == 0 && f.g.reason().find("held 10 min") != std::string::npos;
+    f.run(9 * 60000, true);
+    ok("a removal at the floor holds it there too", at_floor && said && f.kb() == 2000);
 }
 
 static void idle_link()
@@ -213,6 +246,7 @@ int main()
     recovery();
     evidence_resets_health();
     probation();
+    removal_holds();
     idle_link();
     unlimited();
     std::printf(failures ? "%d FAILED\n" : "all ok\n", failures);

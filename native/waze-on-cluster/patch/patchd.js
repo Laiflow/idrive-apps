@@ -11,11 +11,9 @@
  * verified backup), with / remounted read-write only for the write. The new
  * binary takes effect when carplay next starts: patchd restarts carplay only
  * when recmgr loaded a carplay restart entry this boot (restartCarplay), else
- * at the next head-unit start. It applies no patch on its own. The same
- * restart, rate-limited, starts a new phone stream when the render reports it
- * cannot decode the running one (checkResync). Explicit capture commands go to
- * a separately supervised DLT helper; reading logs does not change tracing
- * mode.
+ * at the next head-unit start. It applies no patch on its own. Explicit
+ * capture commands go to a separately supervised DLT helper; reading logs does
+ * not change tracing mode.
  *
  * Protocol (newline-delimited JSON, one object per line):
  *   app -> patchd  {"cmd":"status"}
@@ -50,8 +48,9 @@
  *                    the next head-unit start (carplay is then deferred)
  *                    conflict: why the patch is not applied when the tool is
  *                    installed (a binary the patcher cannot patch, one
- *                    something else modified, a carplay.service that starts
- *                    another program)
+ *                    something else modified, a build outside the patcher's
+ *                    proven list that Enable map has not patched yet, a
+ *                    carplay.service that starts another program)
  *                  {"ev":"log","line":...}   the backlog on connect, then each new line
  *
  * Install-time activation (the deploy tool's activate and deactivate hooks,
@@ -261,6 +260,8 @@ function readState(cb) {
         var known = /known:\s+NO/.test(text) ? false : true;
         var unknownWhy = /known:\s+NO — (.*)/.exec(text);
         var pristine = /known:\s+yes, pristine/.test(text);
+        var proven = !/proven:\s+no/.test(text);
+        var restorable = /^restorable:\s+yes$/m.test(text);
         var backup = /backup:\s+(\S+)/.exec(text);
         var hasBackup = !!backup && backup[1] !== 'none';
         /* "patched" requires every edit: the variant gate, a known sink
@@ -298,10 +299,13 @@ function readState(cb) {
         /* What keeps the tool from writing the patch by itself: a binary the
          * patcher cannot patch (an edit site not found, or one it does not
          * recognise), one something else modified (no backup of ours, not the
-         * pristine build), or another program started as carplay. */
+         * pristine build), a build outside the proven list that Enable map has
+         * not patched (no backup of ours), or another program started as
+         * carplay. */
         var conflict = err && !text ? 'carplay status unreadable: ' + err.message
             : !known ? 'not patchable' + (unknownWhy ? ': ' + unknownWhy[1] : '')
             : !hasBackup && !pristine ? 'carplay was modified by something else'
+            : !hasBackup && !proven ? 'untested carplay build'
             : foreignStart();
         /* A change waiting for the next head-unit start: the running carplay is
          * not the binary on disk, so neither state applies to it yet. */
@@ -310,7 +314,7 @@ function readState(cb) {
         if (pending) { state = 'unknown'; mode = null; reason = pending.reason; carplay = 'deferred'; }
         cachedState = { state: state, panel: variant ? variant[1].toLowerCase() : null, mode: mode, res: res, safe: safe, reason: reason, carplay: carplay,
                         pending: pending ? pending.action || 'apply' : null, pendingBy: pending ? pending.by : null,
-                        conflict: conflict, binary: binary, known: known, backup: hasBackup };
+                        conflict: conflict, binary: binary, known: known, backup: hasBackup, restorable: restorable };
         cb(cachedState);
     });
 }
@@ -356,50 +360,22 @@ function remountRo(tries, cb) {
     });
 }
 
-/* Restarting carplay is safe only while recmgr treats its death as expected:
- * recmgr reboots the head unit when a service its restart list does not name
- * stops, and it reads the list (/etc/recmgr-restartlist.conf) only at boot. So
- * carplay is killed and started only when "carplay" is in both [Whitelist] and
- * [WhitelistExitSuccess] of the list as it stood at boot — the file itself while
- * it is older than the boot, else the copy mgu-deploy saved before this boot's
- * first write (recmgr-at-boot.json) — the rule mgu-deploy uses.
- * On a unit with the stock list a change is left to take effect at the next
- * head-unit start. */
-var RECMGR_CONF = process.env.WOC_RECMGR_CONF || '/etc/recmgr-restartlist.conf';
-var RECMGR_AT_BOOT = process.env.WOC_RECMGR_AT_BOOT || '/var/opt/mgu-deploy/recmgr-at-boot.json';
-var PROC_STAT = process.env.WOC_PROC_STAT || '/proc/stat';
-var BOOT_ID = process.env.WOC_BOOT_ID || '/proc/sys/kernel/random/boot_id';
-
-function recmgrHas(text, name) {
-    var has = { Whitelist: false, WhitelistExitSuccess: false }, section = '';
-    text.split('\n').forEach(function (line) {
-        line = line.trim();
-        if (/^\[.*\]$/.test(line)) { section = line.slice(1, -1); return; }
-        if (has.hasOwnProperty(section) && line === name) has[section] = true;
-    });
-    return has.Whitelist && has.WhitelistExitSuccess;
-}
+/* Restarting carplay is safe only while recmgr treats its death as expected,
+ * so carplay is killed and started only when recmgr loaded its entry this boot
+ * (recmgr_list.js). On a unit whose list recmgr loaded without it a change is
+ * left to take effect at the next head-unit start. */
+var recmgrLoaded = require('./recmgr_list.js').recmgrLoaded;
+var parseShow = require('./recovery.js').parseShow;
 
 function readText(f) { try { return fs.readFileSync(f, 'utf8'); } catch (e) { return null; } }
-
-/* recmgr loaded name's entry this boot. */
-function recmgrLoaded(name) {
-    var cur = readText(RECMGR_CONF);
-    if (cur === null || !recmgrHas(cur, name)) return false;
-    var at = null;
-    try { at = JSON.parse(readText(RECMGR_AT_BOOT)); } catch (e) {}
-    var boot = (readText(BOOT_ID) || '').trim();
-    if (at && at.boot && at.boot === boot) return recmgrHas(at.text || '', name);
-    var btime = /^btime (\d+)$/m.exec(readText(PROC_STAT) || '');
-    if (!btime) return false;
-    try { return fs.statSync(RECMGR_CONF).mtime.getTime() < parseInt(btime[1], 10) * 1000; } catch (e) { return false; }
-}
 
 /* A change written while carplay could not be restarted, and which one:
  * {"action":"apply"|"revert","reason":...}. The marker sits next to the
  * socket in /dev/shm, which the next head-unit start clears; until then
  * status reports it instead of the binary's state. */
 var PENDING = path.join(path.dirname(SOCK), 'activation-pending');
+/* The carplay run restartCarplay kills, for recovery.js. */
+var KILLED = path.join(path.dirname(SOCK), 'carplay-killed');
 var PENDING_REASON = {
     apply: 'patch written; takes effect at the next head-unit start',
     revert: 'patch removed; the original carplay runs from the next head-unit start'
@@ -414,11 +390,15 @@ var PENDING_REASON = {
 var RESTART_POLL_MS = parseInt(process.env.WOC_RESTART_POLL_MS, 10) || 250;
 var RESTART_TRIES = 40;
 function restartCarplay(cb) {
-    cp.execFile('systemctl', ['show', 'carplay.service', '-p', 'MainPID', '--value'], { timeout: 15000 }, function (err, out) {
+    cp.execFile('systemctl', ['show', 'carplay.service', '-p', 'MainPID', '-p', 'InvocationID', '-p', 'ExecMainStartTimestampMonotonic'],
+        { timeout: 15000 }, function (err, out) {
         if (err) { cb(new Error('carplay restart: reading MainPID failed: ' + err.message)); return; }
-        var pid = parseInt(((out || '') + '').trim(), 10);
-        if (!(pid > 0)) { cb(new Error('carplay restart: carplay.service has no main PID (MainPID=' + ((out || '') + '').trim() + '); not restarted')); return; }
+        var run = parseShow((out || '') + ''), pid = run.pid;
+        if (!(pid > 0)) { cb(new Error('carplay restart: carplay.service has no main PID (MainPID=' + pid + '); not restarted')); return; }
         log('restarting carplay: SIGKILL main PID ' + pid + ', then systemctl start');
+        /* The boot-recovery watcher takes the end of this run for patchd's
+         * kill, not a crash. */
+        try { fs.writeFileSync(KILLED, run.run + '\n'); } catch (e) { log('recording the killed run failed: ' + e.message); }
         try { process.kill(pid, 'SIGKILL'); }
         catch (e) { if (e.code !== 'ESRCH') { cb(new Error('carplay restart: SIGKILL ' + pid + ': ' + e.message)); return; } }
         waitCarplayGone(pid, RESTART_TRIES, function (gErr) {
@@ -449,124 +429,6 @@ function waitCarplayActive(tries, cb) {
         if (st === 'active') { cb(null); return; }
         if (tries <= 0) { cb(new Error('carplay restart: carplay.service is ' + (st || 'unknown') + ' after start')); return; }
         setTimeout(function () { waitCarplayActive(tries - 1, cb); }, RESTART_POLL_MS);
-    });
-}
-
-/* Stream resync. The phone sends SPS, PPS and an IDR only when a stream
- * starts, so a render that joined after the start (it restarted), or whose
- * decoder gave up its sequence, decodes nothing until the next stream
- * (PATCH.md "Stream resync"). The
- * render reports, each second, how long the stream has arrived with no
- * keyframe and nothing decoded (STREAM_STATE); past RESYNC_AFTER_MS patchd
- * restarts carplay as it activates a patch (restartCarplay), and the phone
- * starts a new stream. Only when recmgr loaded carplay's restart entry, never
- * during another operation, each attempt spaced from the one before by
- * RESYNC_SPACING_MS (by attempt, the last step repeating), and at most
- * RESYNC_MAX a head-unit start. The counts sit next to the socket, so a
- * patchd restart keeps them and a head-unit start clears them;
- * RESYNC_RESET_MS without a wait sets the spacing back to its first step.
- * The record also says whether patchd has decided for the current wait
- * ("waiting") and why a resync would wait ("held", null when it would go),
- * which the render shows; both are cleared when the wait ends, and patchd
- * rewrites the record at start, so it never carries a previous process's
- * decision. The report is in the render's own directory, so it is read as a
- * small regular file, never through a link and never blocking. */
-var STREAM_STATE = process.env.WOC_STREAM_STATE || path.join(path.dirname(FIFO), 'stream.json');
-var STREAM_STALE_MS = 5000;   /* older: the render is not reporting */
-var RESYNC_FILE = process.env.WOC_RESYNC_FILE || path.join(path.dirname(SOCK), 'resync.json');
-var RESYNC_POLL_MS = parseInt(process.env.WOC_RESYNC_POLL_MS, 10) || 2000;
-var RESYNC_AFTER_MS = parseInt(process.env.WOC_RESYNC_AFTER_MS, 10) || 15000;
-var RESYNC_SPACING_MS = (process.env.WOC_RESYNC_SPACING_MS || '120000,600000,1800000').split(',').map(Number);
-var RESYNC_RESET_MS = parseInt(process.env.WOC_RESYNC_RESET_MS, 10) || 600000;
-var RESYNC_MAX = parseInt(process.env.WOC_RESYNC_MAX, 10) || 6;
-var resync = { attempts: 0, last: null, total: 0 };
-try {
-    var saved = JSON.parse(fs.readFileSync(RESYNC_FILE, 'utf8'));
-    if (saved.total > 0) resync = { attempts: saved.attempts || 0, last: typeof saved.last === 'number' ? saved.last : null, total: saved.total };
-} catch (e) {}
-var calmSince = null, resyncWaiting = false, resyncHeld = null, resyncing = false;
-
-function saveResync() {
-    var record = Object.assign({ waiting: resyncWaiting, held: resyncHeld }, resync);
-    /* Written whole and renamed into place: the render reads it any time. */
-    var tmp = RESYNC_FILE + '.tmp';
-    try {
-        fs.writeFileSync(tmp, JSON.stringify(record) + '\n');
-        fs.renameSync(tmp, RESYNC_FILE);
-    } catch (e) { log('resync state: ' + e.message); }
-}
-
-function streamWait() {
-    var fd = -1;
-    try {
-        fd = fs.openSync(STREAM_STATE, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
-        var st = fs.fstatSync(fd);
-        if (!st.isFile() || st.size > 256 || Date.now() - st.mtime.getTime() > STREAM_STALE_MS) return null;
-        var buf = Buffer.alloc(st.size);
-        var w = JSON.parse(buf.toString('utf8', 0, fs.readSync(fd, buf, 0, st.size, 0))).keyframe_wait_ms;
-        return typeof w === 'number' ? w : null;
-    } catch (e) {
-        return null;
-    } finally {
-        if (fd >= 0) fs.closeSync(fd);
-    }
-}
-
-/* Records whether there is a wait patchd has decided for, and why a
- * resync would wait (null: it would go, or no wait); logs each new reason. */
-function decideResync(waiting, reason) {
-    if (resyncWaiting === waiting && resyncHeld === reason) return;
-    if (reason && reason !== resyncHeld) log('resync held: ' + reason);
-    resyncWaiting = waiting;
-    resyncHeld = reason;
-    saveResync();
-}
-
-/* Why a due resync would wait; null: it would go. */
-function resyncHold(now) {
-    if (busy || quitting || rebooting) return 'another operation is running';
-    if (resync.total >= RESYNC_MAX) return RESYNC_MAX + ' attempts this head-unit start';
-    if (resync.attempts > 0) {
-        if (now < resync.last) resync.last = now;   /* the clock went back: a full spacing from now */
-        var spacing = RESYNC_SPACING_MS[Math.min(resync.attempts, RESYNC_SPACING_MS.length) - 1];
-        if (now - resync.last < spacing)
-            return 'attempt ' + (resync.attempts + 1) + ' waits ' + Math.round(spacing / 1000) + ' s after the last';
-    }
-    if (!recmgrLoaded('carplay')) return 'recmgr did not load a carplay restart entry this boot';
-    return null;
-}
-
-function checkResync() {
-    if (resyncing) return;
-    var now = Date.now(), wait = streamWait();
-    if (wait === null) return;
-    if (wait === 0) {
-        decideResync(false, null);
-        if (calmSince === null) calmSince = now;
-        if (resync.attempts > 0 && now - calmSince >= RESYNC_RESET_MS) {
-            resync.attempts = 0;
-            saveResync();
-            log('resync: no wait for ' + Math.round(RESYNC_RESET_MS / 1000) + ' s; spacing back to its first step');
-        }
-        return;
-    }
-    calmSince = null;
-    /* Decided from the wait's start, so the render can say at once whether
-     * CarPlay will be restarted. */
-    decideResync(true, resyncHold(now));
-    if (resyncHeld || wait < RESYNC_AFTER_MS) return;
-    resync = { attempts: resync.attempts + 1, last: now, total: resync.total + 1 };
-    saveResync();
-    /* Not busy: the patch state the app shows is unchanged; apply, revert
-     * and reboot wait for it like for any operation. */
-    resyncing = true;
-    log('resync: the stream has arrived for ' + Math.round(wait / 1000) + ' s with no keyframe and nothing decoded; ' +
-        'restarting carplay for a new stream (attempt ' + resync.attempts + ', ' + resync.total + ' this head-unit start)');
-    restartCarplay(function (err) {
-        resyncing = false;
-        log(err ? 'resync failed: ' + err.message : 'resync: carplay restarted');
-        status();   /* the state again for a client refused as busy meanwhile */
-        quitWhenIdle();
     });
 }
 
@@ -786,7 +648,7 @@ function quit() {
     quitWhenIdle();
 }
 function quitWhenIdle() {
-    if (quitting && !busy && !resyncing) process.exit(0);
+    if (quitting && !busy) process.exit(0);
 }
 
 /* Restore / to read-only, and never leave it writable: if the remount keeps
@@ -902,10 +764,12 @@ function runPatch(args, action, noRestart, done) {
  * "avb": the stock avb:// sink, the media bus the render joins (the mode the
  * app applies). "udp": Edit 2 sink -> udp://127.0.0.1:UDP_PORT, the stream
  * sink the projection bridge accepts, which this tool receives. "fifo": sink
- * -> the file:// FIFO (the bridge rejects it on the car). */
-function apply(panel, mode, noRestart, done) {
+ * -> the file:// FIFO (the bridge rejects it on the car). `unproven`: the
+ * user's Enable map, which also patches a build outside the proven list;
+ * install-time activation never does. */
+function apply(panel, mode, noRestart, unproven, done) {
     if (panel !== 'high' && panel !== 'mid') { done(new Error('panel must be high or mid')); return; }
-    var args = ['apply', '--panel', panel, '--target', TARGET, '--yes'];
+    var args = ['apply', '--panel', panel, '--target', TARGET, '--yes'].concat(unproven ? ['--unproven'] : []);
     if (mode === 'avb') {
         log('apply IC_' + panel.toUpperCase() + ', stock AVB sink (the render joins the media bus)');
     } else if (mode === 'udp') {
@@ -958,7 +822,7 @@ function handle(line, sock) {
          * repeated press cannot reboot at the wrong time: only when a change is
          * actually pending, not while an operation runs, and once. */
         var deny = rebooting ? 'a restart is already in progress'
-            : busy || resyncing ? 'another operation is running'
+            : busy ? 'another operation is running'
             : quitting ? 'patchd is stopping'
             : !fs.existsSync(PENDING) ? 'no restart is pending'
             : null;
@@ -980,7 +844,7 @@ function handle(line, sock) {
         return;
     }
 
-    if (busy || resyncing || quitting || rebooting) { send({ ev: 'status', state: 'busy', reason: quitting ? 'patchd is stopping' : rebooting ? 'a restart is in progress' : 'another operation is running' }); return; }
+    if (busy || quitting || rebooting) { send({ ev: 'status', state: 'busy', reason: quitting ? 'patchd is stopping' : rebooting ? 'a restart is in progress' : 'another operation is running' }); return; }
 
     if (msg.cmd === 'apply' || msg.cmd === 'revert') {
         var op = msg.cmd;
@@ -988,7 +852,7 @@ function handle(line, sock) {
         var mode = (msg.mode === 'avb' || msg.mode === 'udp') ? msg.mode : 'fifo';   /* capture mode; default fifo */
         busy = true;
         status({ reason: op === 'apply' ? 'applying' : 'reverting' });
-        var fn = op === 'apply' ? function (cb) { apply(panel, mode, false, cb); } : function (cb) { revert(false, false, cb); };
+        var fn = op === 'apply' ? function (cb) { apply(panel, mode, false, true, cb); } : function (cb) { revert(false, false, cb); };
         /* Hold the shared remount lock so the boot-recovery service does not
          * remount / at the same time. User-driven, so it proceeds after a short
          * wait even if the lock looks stuck; recovery yields to it. */
@@ -1057,17 +921,21 @@ function ensureDir(dir) {
 /* What activate and deactivate do with the binary as readState found it:
  * { op: "apply" | "revert", or none and why }. activate applies Enable map's
  * patch (high panel, the stock media-bus sink, the patcher's size and safe
- * area) to a known binary: an original no one reverted (no backup of ours) or
- * a patch of ours, any configuration of it, which the patcher brings up to
- * date or leaves as it is; an original with our backup was reverted by the
- * user and stays so, as does a pending change other than a removal's
- * revert (an install after a removal patches again). deactivate reverts a
- * patch of ours, a pending one too, and drops our backup, so a later install
+ * area) to a known binary without a conflict: a proven original (no backup of
+ * ours) or a patch of ours, any configuration of it, which the patcher brings
+ * up to date or leaves as it is; an original with our backup was reverted by
+ * the user and stays so, as does a pending change other than a removal's
+ * revert. After a removal's revert an install patches a proven build again; a
+ * build outside the proven list, its backup dropped, stays reverted (a
+ * conflict). deactivate reverts a patch of ours, a pending one too, also one
+ * the patcher no longer recognises when our verified backup of the same build
+ * differs from it (restorable), and drops our backup, so a later install
  * starts from the original as a fresh one does. */
 function plan(which, st) {
     if (st.pending && which === 'activate' && !(st.pending === 'revert' && st.pendingBy === 'removal')) {
         return { why: 'a change already waits for the next head-unit start' };
     }
+    if (which === 'deactivate' && st.restorable) return { op: 'revert' };
     if (st.conflict && (which === 'activate' || !st.known)) return { conflict: st.conflict };
     if (which === 'deactivate') return st.binary === 'original' && !st.backup ? { why: 'carplay is the original' } : { op: 'revert' };
     if (st.binary === 'original' && st.backup) return { why: 'the map patch was turned off; Enable map applies it' };
@@ -1113,7 +981,7 @@ function oneShot(which) {
                 return;
             }
             var before = sha(TARGET);
-            var run = p.op === 'apply' ? function (cb) { log(which + ': applying the map patch'); apply('high', 'avb', true, cb); }
+            var run = p.op === 'apply' ? function (cb) { log(which + ': applying the map patch'); apply('high', 'avb', true, false, cb); }
                 : function (cb) { log(which + ': reverting the map patch'); revert(true, true, cb); };
             run(function (pErr, roErr, activation, refused) {
                 var written = sha(TARGET) !== before;
@@ -1127,7 +995,7 @@ function oneShot(which) {
                     return;
                 }
                 /* The patcher would not touch it: left as it is, for the user. */
-                if (refused && /refusing|requires the pristine|not a recognised|no backup/.test(refused)) {
+                if (refused && /refusing|requires the pristine|not a proven build|not a recognised|no backup/.test(refused)) {
                     result.status = 'carplay left as it is: ' + refused;
                     result.conflict = refused;
                     log(which + ': ' + result.status);
@@ -1163,8 +1031,6 @@ function main() {
         setInterval(function () {
             captureCommand('status', function (state) { send({ ev: 'capture', capture: state }); });
         }, 1000);
-        saveResync();   /* no hold reason from a previous process */
-        setInterval(checkResync, RESYNC_POLL_MS);
     }); });
     server.on('error', function (e) { process.stderr.write('patchd: ' + e.message + '\n'); process.exit(1); });
     process.on('SIGTERM', quit);

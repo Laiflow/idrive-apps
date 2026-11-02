@@ -3,14 +3,14 @@
 /* Whether the decoder joined the phone's stream after it started.
  *
  * The phone sends SPS, PPS and an IDR only when a stream starts (PATCH.md
- * "Stream resync"), so a decoder that missed the start, or gave up its
+ * "Keyframe cadence"), so a decoder that missed the start, or gave up its
  * sequence (decoder_msdk.h), decodes nothing until the next stream. Sampled about once a second: while
  * the stream keeps arriving with no frame decoded and no SPS or IDR, the wait
  * grows from the first such sample. It is 0 once a frame decodes or the
  * stream stops arriving, and from a keyframe that arrives after the last
  * decoded frame (or before any) until a frame decodes: the stream carried a
- * keyframe and the decoder did not start or decode from it, which is not
- * what a resync is for. */
+ * keyframe and the decoder did not start or decode from it, which is not a
+ * missed start. */
 #ifndef WOC_KEYFRAME_WAIT_H
 #define WOC_KEYFRAME_WAIT_H
 

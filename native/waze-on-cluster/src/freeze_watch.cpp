@@ -43,7 +43,23 @@ bool ChangeSampler::changed(const uint8_t *y)
 
 void FreezeWatch::frame(int64_t now_ms, bool changed, bool blank)
 {
+    if (live_) {
+        add(now_ms, changed, blank);
+        return;
+    }
+    before_.push_back(Seen{now_ms, changed, blank});
+    while (now_ms - before_.front().ms > kLiveLagMs)
+        before_.pop_front();
+}
+
+void FreezeWatch::add(int64_t now_ms, bool changed, bool blank)
+{
+    framed_ = true;
     pictured_ = pictured_ || !blank;
+    if (!blank)
+        blank_since_ms_ = -1;
+    else if (blank_since_ms_ < 0)
+        blank_since_ms_ = now_ms;
     if (changed || !blank || unchanged_since_ms_ < 0) {
         unchanged_since_ms_ = now_ms;
         times_.clear();
@@ -54,12 +70,23 @@ void FreezeWatch::frame(int64_t now_ms, bool changed, bool blank)
         times_.pop_front();
 }
 
-void FreezeWatch::live(bool on)
+void FreezeWatch::live(bool on, int64_t now_ms)
 {
     if (on == live_)
         return;
     live_ = on;
-    pictured_ = false;
+    reset();
+    if (on)
+        for (const Seen &s : before_)
+            if (now_ms - s.ms <= kLiveLagMs)
+                add(s.ms, s.changed, s.blank);
+    before_.clear();
+}
+
+void FreezeWatch::reset()
+{
+    framed_ = pictured_ = false;
+    blank_since_ms_ = -1;
     unchanged_since_ms_ = -1;
     times_.clear();
 }
@@ -76,6 +103,15 @@ bool FreezeWatch::frozen(int64_t now_ms) const
         if (now_ms - t <= (int64_t)cfg_.ms)
             recent++;
     return recent * 1000 >= (size_t)cfg_.min_fps * cfg_.ms;
+}
+
+Picture FreezeWatch::picture(int64_t now_ms) const
+{
+    if (!framed_)
+        return Picture::None;
+    if (!pictured_ || (blank_since_ms_ >= 0 && now_ms - blank_since_ms_ >= (int64_t)cfg_.blank_ms))
+        return Picture::Blank;
+    return Picture::Shown;
 }
 
 void FrameTally::frame(int64_t now_ms, bool changed, bool blank)

@@ -108,23 +108,17 @@ bool StreamHealth::lost() const
     return state_ == Waiting || !arriving_since_.empty();
 }
 
-std::string StreamHealth::reason(const ResyncState &resync) const
+std::string StreamHealth::reason() const
 {
-    if (!lost())
-        return std::string();
-    return resync.restarts() ? "Stream lost — restarting CarPlay" : "Stream lost — reconnect CarPlay";
+    return lost() ? "Stream lost — reconnect CarPlay" : std::string();
 }
 
-std::string StreamHealth::detail(const ResyncState &resync) const
+std::string StreamHealth::detail() const
 {
-    const std::string patchd = resync.restarts()                 ? "patchd restarts CarPlay for a new stream"
-                               : !resync.read                    ? "patchd's resync record not readable"
-                               : resync.waiting                  ? "resync held: " + resync.held
-                                                                 : "patchd has not decided on a resync yet";
     if (state_ == Waiting)
-        return "the decoder gave up its sequence at " + since_ + " and waits for a keyframe; " + patchd;
+        return "the decoder gave up its sequence at " + since_ + " and waits for a keyframe";
     if (!arriving_since_.empty())
-        return "the stream arrives with nothing decoded since " + arriving_since_ + "; " + patchd;
+        return "the stream arrives with nothing decoded since " + arriving_since_;
     return state_ == Through ? "lost part of the stream at " + since_ + "; decoding through it" : std::string();
 }
 

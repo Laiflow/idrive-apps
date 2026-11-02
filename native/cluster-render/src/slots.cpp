@@ -200,6 +200,7 @@ void SlotManager::drop_scene(int i)
     scenes_->unpublish(specs_[i]);
     subs_.erase(specs_[i].scene_id);
     t_[i].scene = false;
+    t_[i].resend_due = false;
 }
 
 void SlotManager::unpublish_all()
@@ -260,7 +261,7 @@ void SlotManager::acquire(int i, int64_t now_ms)
         return;
     }
     if (t.scene) {
-        scenes_->resent(spec, now_ms);
+        t.resend_due = true;
     } else {
         const int other = by_published(spec.scene_id);   /* released: scene_busy */
         if (other >= 0) {
@@ -332,6 +333,7 @@ void SlotManager::on_shown(uint64_t scene_id, int64_t now_ms)
     if (s == TargetState::Parked)
         log_info("target %s: shown, after %lld ms parked", specs_[i].name.c_str(),
                  (long long)(now_ms - t_[i].since_ms));
+    charge_resend(i, now_ms);
     set(i, TargetState::Shown, Holder::Us, "", now_ms);
     t_[i].shown_ms = t_[i].check_ms = now_ms;
     t_[i].removed_ms = -1;
@@ -352,10 +354,22 @@ void SlotManager::on_parked(uint64_t scene_id, int64_t now_ms)
         park(i, now_ms);
 }
 
+/* A warm scene the display has fetched again went whole to its renderer
+ * when it subscribed: charged to the byte budget then, once, since a fetch
+ * the display fails sends nothing. */
+void SlotManager::charge_resend(int i, int64_t now_ms)
+{
+    if (!t_[i].resend_due)
+        return;
+    t_[i].resend_due = false;
+    scenes_->resent(specs_[i], now_ms);
+}
+
 /* Mapped and fetched, invisible behind the content the slot shows, until
  * the display shows it: no timeout. The table names who is shown. */
 void SlotManager::park(int i, int64_t now_ms)
 {
+    charge_resend(i, now_ms);
     const Holder h = other_holder(i);
     log_info("target %s: %s in slot 0x%llx", specs_[i].name.c_str(), parked_reason(h).c_str(),
              (unsigned long long)specs_[i].slot);

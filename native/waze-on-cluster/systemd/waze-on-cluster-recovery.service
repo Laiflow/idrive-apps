@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Robert Nisipeanu
 [Unit]
-Description=waze-on-cluster boot recovery: restore the original carplay if the map patch makes it crash-loop
+Description=waze-on-cluster boot recovery: watch carplay and restore the original if the map patch makes it crash
 RequiresMountsFor=/var/opt
-After=local-fs.target
+After=local-fs.target waze-on-cluster-boot.service
 
 [Service]
 # Root, like patchd: it remounts / read-write only to run the vetted,
-# reversible carplay_patch.js revert (verified backup, SHA gate), then read-only
-# again. It never kills, restarts or reboots anything; it only replaces the
-# on-disk binary, which the next carplay start picks up. Long-running: it checks
-# at boot, then watches carplay so a healthy start clears the counter and a
-# clean shutdown (SIGTERM) exempts the boot.
+# reversible carplay_patch.js revert (verified backup, SHA gate), then
+# read-only again. Long-running: it records each carplay crash the moment it
+# sees it and marks a healthy carplay. Where recmgr loaded carplay's entry
+# this boot, it restores at the threshold and runs `systemctl start
+# carplay.service` after a crash (bounded per boot); without the entry it
+# only records. It never stops, kills, restarts or reboots anything (PATCH.md
+# "Boot recovery").
 ExecStart=/usr/bin/node /var/opt/waze-on-cluster/current/recovery.js
 Restart=always
 RestartSec=5
-# On stop, signal only the daemon (not its mount/revert children) and give an
-# in-progress restore time to finish, so / is never left writable.
+# On stop, signal only the daemon (not its mount/revert children); it exits
+# once an in-progress restore has finished, which takes at most 71 s
+# (recovery.js RESTORE_BOUND_MS), so / is never left writable.
 KillMode=mixed
 TimeoutStopSec=90
 StandardOutput=journal

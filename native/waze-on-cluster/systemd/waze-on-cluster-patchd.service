@@ -10,9 +10,7 @@ After=local-fs.target
 # socket; this daemon runs the vetted, reversible carplay_patch.js with / briefly
 # remounted read-write, then activates the change per PATCH.md "Activation"
 # (SIGKILL+start only where recmgr allows it, otherwise at the next head-unit
-# start). It applies no patch on its own; on its own it only restarts carplay,
-# rate-limited, when the render cannot decode the running stream (PATCH.md
-# "Stream resync").
+# start). It applies no patch on its own.
 ExecStart=/usr/bin/node /var/opt/waze-on-cluster/current/patchd.js
 Restart=always
 RestartSec=5

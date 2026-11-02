@@ -15,10 +15,10 @@
  * followed by an SPS is a new stream, not a loss.
  *
  * Only a lost stream has a status reason, short operator text; the map
- * shows through a loss. The detail, with when the episode began and
- * patchd's resync state, is for the log and probe.txt. Each loss, new stream
- * and return to a clean picture is a log line, at most kLinesPerMinute a
- * minute; the minute line counts them all. Not thread-safe. */
+ * shows through a loss. The detail, with when the episode began, is for the
+ * log and probe.txt. Each loss, new stream and return to a clean picture is
+ * a log line, at most kLinesPerMinute a minute; the minute line counts them
+ * all. Not thread-safe. */
 #ifndef WOC_STREAM_HEALTH_H
 #define WOC_STREAM_HEALTH_H
 
@@ -26,15 +26,6 @@
 #include <string>
 
 namespace woc {
-
-/* patchd's resync record (its resync.json): read; whether patchd has
- * decided for the current wait of the stream ("waiting"), and why it would
- * hold the resync ("" when it would restart CarPlay). */
-struct ResyncState {
-    bool read = false, waiting = false;
-    std::string held;
-    bool restarts() const { return read && waiting && held.empty(); }
-};
 
 class StreamHealth {
 public:
@@ -69,10 +60,10 @@ public:
     /* The decoder gave up, or the keyframe wait reached kLostMs. */
     bool lost() const;
     /* The status reason: empty unless the stream is lost. */
-    std::string reason(const ResyncState &resync) const;
-    /* What the stream is, with when the episode began and patchd's resync
-     * state; empty while it is whole. */
-    std::string detail(const ResyncState &resync) const;
+    std::string reason() const;
+    /* What the stream is, with when the episode began; empty while it is
+     * whole. */
+    std::string detail() const;
     /* The counts since the last call. */
     Minute take_minute();
 

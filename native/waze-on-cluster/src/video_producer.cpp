@@ -379,16 +379,22 @@ bool VideoProducer::take(std::vector<uint8_t> *frame, uint64_t *id)
     return true;
 }
 
-void VideoProducer::set_live(bool on)
+void VideoProducer::set_live(bool on, int64_t now_ms)
 {
     std::lock_guard<std::mutex> lock(frame_mutex_);
-    freeze_.live(on);
+    freeze_.live(on, now_ms);
 }
 
 bool VideoProducer::frozen(int64_t now_ms) const
 {
     std::lock_guard<std::mutex> lock(frame_mutex_);
     return freeze_.frozen(now_ms);
+}
+
+Picture VideoProducer::picture(int64_t now_ms) const
+{
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    return freeze_.picture(now_ms);
 }
 
 uint32_t VideoProducer::decode_errors(std::string *last) const
@@ -412,16 +418,16 @@ bool VideoProducer::minute(int64_t now_ms, FrameTally::Minute *m, StreamHealth::
     return true;
 }
 
-std::string VideoProducer::stream_reason(const ResyncState &resync) const
+std::string VideoProducer::stream_reason() const
 {
     std::lock_guard<std::mutex> lock(frame_mutex_);
-    return health_.reason(resync);
+    return health_.reason();
 }
 
-std::string VideoProducer::stream_detail(const ResyncState &resync) const
+std::string VideoProducer::stream_detail() const
 {
     std::lock_guard<std::mutex> lock(frame_mutex_);
-    return health_.detail(resync);
+    return health_.detail();
 }
 
 bool VideoProducer::stream_lost() const

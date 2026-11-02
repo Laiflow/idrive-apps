@@ -21,12 +21,28 @@
  *   stock map back; live again: shown with the frames; frozen: hidden, the
  *   status says so; no longer frozen: shown again;
  * - before the stream is live the layer is made hidden;
+ * - the stream's pictures through the change sampler and freeze watch, as
+ *   the service runs them: a stream blank from its start (the car's burst,
+ *   then a pause) never asks for the slot, the stock map stays and the app
+ *   is told to start navigation; the first non-blank frame, with no frame
+ *   after it, takes the slot over and shows that frame; blank spells
+ *   shorter than blank_ms between pictures keep the map up without asking
+ *   for the slot again; a picture blank for blank_ms gives the slot back to
+ *   the stock map, and the next picture takes it again; a stream blank at
+ *   full rate from its start is frozen, the stock map showing; live
+ *   through a recent frame (no connection to read), a static map's frame
+ *   every 10 s takes the slot over each time it makes the stream live;
+ *   a frame of the ended stream decoded after it ended, seconds before the
+ *   next stream is live, does not take the slot for it, while one decoded
+ *   just before it is live does; the stream ending is logged once, whatever
+ *   frames still come;
  * - the status is logged when its state, reason or target changes, not for
  *   the frame rate, the page or the upload cap. */
 #include <poll.h>
 #include <signal.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -37,6 +53,7 @@
 #include "test/fake_graph.h"
 #include "test/fake_port.h"
 #include "../src/map_feed.h"
+#include "src/log.h"
 
 using namespace woc;
 
@@ -59,8 +76,19 @@ struct Rig {
     std::unique_ptr<MapFeed> feed;
     int64_t now = 200000;
     std::vector<uint8_t> spare;   /* the buffer handed to the feed, as the producer's */
+    /* watched: the frames' pictures drive the stream state, as in the
+     * service's loop; otherwise the stream is live with a picture */
+    bool watched;
+    /* watched and > 0: live while a frame came within this long, as the
+     * service decides without the stream's connection; 0: live while live
+     * is set, as the stream's connection says */
+    int64_t live_stall_ms = 0;
+    bool live = true;
+    int64_t last_frame_ms = -1;
+    FreezeWatch watch{FreezeConfig()};
+    ChangeSampler sampler{1088, 480};
 
-    Rig()
+    explicit Rig(bool w = false, unsigned stall_ms = 6000) : watched(w)
     {
         crs::TargetSpec m, p;
         m.name = "map"; m.slot = 0x100; m.scene_id = 0x010004f0; m.width = 1088; m.height = 480; m.linger_ms = 1500;
@@ -73,8 +101,10 @@ struct Rig {
         FeedConfig fc;
         fc.socket = path;
         fc.video.level_bits = 0;
+        fc.video.stall_ms = stall_ms;
         feed.reset(new MapFeed(fc));
-        feed->set_stream(true, false);
+        watch.live(true, now);
+        feed->set_stream(true, false, watched ? watch.picture(now) : Picture::Shown);
     }
     void start()
     {
@@ -93,6 +123,16 @@ struct Rig {
             if (frame && t % frame_every == 0) {
                 spare.assign(frame->begin(), frame->end());
                 feed->offer(&spare, (uint64_t)now, now);
+                if (watched) {
+                    const bool changed = sampler.changed(frame->data());
+                    watch.frame(now, changed, sampler.blank());
+                    last_frame_ms = now;
+                }
+            }
+            if (watched) {
+                const bool on = live_stall_ms ? last_frame_ms >= 0 && now - last_frame_ms <= live_stall_ms : live;
+                watch.live(on, now);
+                feed->set_stream(on, watch.frozen(now), watch.picture(now));
             }
             for (int round = 0; round < 400; round++) {
                 std::vector<pollfd> fds;
@@ -152,7 +192,7 @@ int main()
     ok("granted: showing, with the decoded frame in the slot's scene",
        r.st().state == "showing" && drawn && r.st().page.find("Waze map — ") == 0);
     ok("the status line counts the frames handed over", r.st().page.find("15 frames/s") != std::string::npos);
-    const std::string lost = "Stream lost — restarting CarPlay";   /* until the layer stalls */
+    const std::string lost = "Stream lost — reconnect CarPlay";   /* until the layer stalls */
     ok("showing carries the stream's reason", r.feed->status("decode", lost).state == "showing" &&
                                                   r.feed->status("decode", lost).reason == lost &&
                                                   r.feed->status("decode", lost).stream_reason);
@@ -221,13 +261,14 @@ int main()
 
     /* the governor counts evidence seen while writes go */
     r.svc->compositor().governor().activity(r.now);
-    r.svc->compositor().governor().evidence(crs::Evidence::Removal, r.now);
+    r.svc->compositor().governor().evidence(crs::Evidence::LinkStall, r.now);
+    r.svc->compositor().governor().evidence(crs::Evidence::LinkStall, r.now);
     r.pump(100, &f1);
     ok("a lowered shared upload cap shows on the status line",
        r.st().page.find("upload cap 5000 KB/s") != std::string::npos);
     ok("the status carries the cap and why",
        r.st().upload_cap_kb == 5000 && r.st().upload_reason.find("lowered from 5500 KB/s") == 0 &&
-           r.st().upload_reason.find("scene removed") != std::string::npos);
+           r.st().upload_reason.find("heartbeat replies silent") != std::string::npos);
     /* A minute of healthy upload raises it back to the ceiling, which the
      * status line leaves out. */
     for (int s = 0; s < 62; s++) {
@@ -239,31 +280,135 @@ int main()
            r.st().upload_reason.find("raised from 5000 KB/s") == 0);
     /* the stream's liveness drives the layer, whatever the frames do */
     const int before = r.port.releases;
-    r.feed->set_stream(false, false);
+    r.feed->set_stream(false, false, Picture::Shown);
     r.pump(2000, &f1);   /* the fade out, then the linger */
     stock = r.port.row(0x100, 0x01000101);
     ok("the stream not live: the layer hidden, idle, and the slot released, the parked stock map shown",
        r.map_layer() && !r.map_layer()->params.visible && r.st().state == "idle" && r.port.releases > before &&
            !r.port.row(0x100, 0x010004f0) && stock && stock->map_status == 1);
     ok("and no stream reason", r.feed->status("decode", waiting).reason.empty());
-    r.feed->set_stream(true, false);
+    r.feed->set_stream(true, false, Picture::Shown);
     r.pump(1200, &f1);
     ok("live again: visible and showing with the frames", r.map_layer()->params.visible && r.st().state == "showing");
-    r.feed->set_stream(true, true);
+    r.feed->set_stream(true, true, Picture::Blank);
     r.pump(100, &f1);
     ok("frozen: hidden, and the status says why",
        !r.map_layer()->params.visible && r.st().state == "frozen" && r.st().reason == "the phone's cluster stream froze");
-    r.feed->set_stream(true, false);
+    r.feed->set_stream(true, false, Picture::Shown);
     r.pump(1200, &f1);
     ok("no longer frozen: shown again", r.map_layer()->params.visible && r.st().state == "showing");
 
     Rig h;
-    h.feed->set_stream(false, false);
+    h.feed->set_stream(false, false, Picture::None);
     h.svc.reset();
     h.start();
     h.pump(3000, &f1);
     ok("a layer made while the stream is not live is hidden: idle, the slot not asked for",
        h.map_layer() && !h.map_layer()->params.visible && h.st().state == "idle" && h.port.requests == 0);
+
+    /* The stream's own pictures, from a stream start with the stock map up. */
+    std::vector<uint8_t> black(1088 * 720, 128);
+    std::fill(black.begin(), black.begin() + 1088 * 480, 16);
+    Rig b(true, 60000);
+    b.port.stock_map(0x100, 0x01000101);
+    b.pump(100);
+    ok("blank start: live, no frame yet: idle, no reason, the slot not asked for",
+       b.st().state == "idle" && b.st().reason.empty() && b.port.requests == 0);
+    b.pump(2000, &black, 20);   /* the car's start: about 100 blank frames in 2 s */
+    b.pump(60000);              /* then a pause */
+    const crs::SlotInfo *stock_b = b.port.row(0x100, 0x01000101);
+    ok("blank start: the burst and a minute's pause never ask for the slot; the stock map stays",
+       b.port.requests == 0 && !b.port.row(0x100, 0x010004f0) && stock_b && stock_b->map_status == 1 &&
+           b.map_layer() && !b.map_layer()->params.visible);
+    ok("blank start: idle, and the app is told to start navigation",
+       b.st().state == "idle" && b.st().reason == MapFeed::kWaiting && !b.st().stream_reason &&
+           b.st().reason == "Waiting for the phone's map — start navigation");
+    ok("blank start: a lost stream's reason comes first",
+       b.feed->status("decode", lost).reason == lost && b.feed->status("decode", lost).stream_reason);
+    b.pump(5, &f1);   /* one non-blank frame, then nothing */
+    b.pump(1500);
+    g = b.gpu.graph("map");
+    drawn = false;
+    if (g)
+        for (const auto &kv : g->shown.buffers)
+            drawn = drawn || (kv.second.f == crs::TexFormat::R8 && kv.second.px == f1);
+    stock_b = b.port.row(0x100, 0x01000101);
+    ok("first picture: the slot asked for once, the stock map taken over, that frame shown",
+       b.st().state == "showing" && drawn && b.port.requests == 1 && b.port.taken_over.size() == 1 && stock_b &&
+           stock_b->map_status == 3);
+    for (int spell = 0; spell < 6; spell++) {
+        b.pump(9000, &black, 1000);   /* a blank frame a second for 9 s */
+        b.pump(5, &f1);
+    }
+    ok("blank spells of 9 s between pictures: showing throughout, the slot not asked for again",
+       b.st().state == "showing" && b.port.requests == 1 && b.map_layer()->params.visible);
+    const int rel_b = b.port.releases;
+    b.pump(5, &black);   /* one blank frame, then nothing */
+    b.pump(9900);
+    ok("one blank frame, then nothing: the map stays until blank_ms",
+       b.st().state == "showing" && b.port.releases == rel_b);
+    b.pump(2500);   /* blank_ms, then the fade out and the linger */
+    stock_b = b.port.row(0x100, 0x01000101);
+    ok("blank for blank_ms: hidden, the slot given back, the stock map shown, the app told to start navigation",
+       !b.map_layer()->params.visible && b.port.releases > rel_b && !b.port.row(0x100, 0x010004f0) && stock_b &&
+           stock_b->map_status == 1 && b.st().state == "idle" && b.st().reason == MapFeed::kWaiting);
+    b.pump(5, &f1);
+    b.pump(1500);
+    ok("the next picture takes the slot again", b.st().state == "showing" && b.port.requests == 2);
+
+    Rig fz(true, 60000);
+    fz.port.stock_map(0x100, 0x01000101);
+    fz.pump(31000, &black, 65);   /* blank at 15 fps from the start */
+    ok("blank at full rate from the start: frozen after 30 s, the slot never asked for",
+       fz.st().state == "frozen" && fz.port.requests == 0 && !fz.map_layer()->params.visible);
+
+    Rig lf(true, 60000);
+    lf.live_stall_ms = 6000;
+    lf.port.stock_map(0x100, 0x01000101);
+    lf.pump(100);
+    bool every = true;
+    for (int k = 0; k < 3; k++) {
+        lf.pump(5, &f1);   /* one frame, then nothing for 10 s */
+        lf.pump(1500);
+        every = every && lf.st().state == "showing" && lf.map_layer()->params.visible;
+        lf.pump(8500);
+        every = every && lf.st().state == "idle";
+    }
+    ok("live through a recent frame: a static map's frame every 10 s is shown each time it makes the stream live",
+       every && lf.port.requests == 3);
+
+    Rig nl(true, 60000);
+    nl.port.stock_map(0x100, 0x01000101);
+    nl.pump(1500, &f1);
+    ok("reconnect: the first stream shows", nl.st().state == "showing" && nl.port.requests == 1);
+    uint64_t seq = 0;
+    std::vector<std::string> lines;
+    cld::log_lines_since(&seq, &lines);
+    lines.clear();
+    nl.live = false;   /* the connection ends */
+    nl.pump(2000);
+    nl.pump(5, &f1);   /* the ended stream's last frame, still on its way */
+    nl.pump(200, &black, 20);
+    nl.pump(3500);
+    nl.live = true;   /* the next connection */
+    nl.pump(1500);
+    const crs::SlotInfo *stock_nl = nl.port.row(0x100, 0x01000101);
+    ok("reconnect: a frame decoded after the end, the next stream live seconds later: idle, hidden, the stock map shown",
+       nl.st().state == "idle" && nl.st().reason.empty() && !nl.map_layer()->params.visible &&
+           nl.port.requests == 1 && stock_nl && stock_nl->map_status == 1);
+    cld::log_lines_since(&seq, &lines);
+    int not_live = 0;
+    for (const std::string &line : lines)
+        not_live += line.find("cluster stream is not live") != std::string::npos;
+    ok("reconnect: the stream ending is logged once, whatever frames still come", not_live == 1);
+    nl.live = false;
+    nl.pump(2000);
+    nl.pump(5, &f1);
+    nl.pump(500);
+    nl.live = true;   /* a new stream's first frame, decoded before its connection is read */
+    nl.pump(1500);
+    ok("reconnect: a frame decoded just before the stream is live takes the slot",
+       nl.st().state == "showing" && nl.port.requests == 2);
 
     StatusLog sl;
     FeedStatus a;

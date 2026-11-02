@@ -21,9 +21,9 @@
  * the id. After a release the next request waits for the display's
  * confirmation and the renderer's unsubscription, at most 1 s; a fetch failing right after the publication is
  * asked again after 250 ms, three times, then on the ladder; a scene the
- * display removed is asked for again no sooner than 5 s after, and a fetch
- * failing within 300 ms of that request is asked again after 1.5 s, three
- * times, then on the ladder. Rendering: a
+ * display removed is asked for again 2 s after, and a fetch failing within
+ * 300 ms of that request is asked again after 1.5 s, four times, then on
+ * the ladder. Rendering: a
  * shown scene its renderer subscribed to is verified; one not subscribed
  * 1.5 s after it was shown, or after the renderer unsubscribed, is released
  * and asked for again at once, then on the ladder, its scene kept; with no
@@ -87,6 +87,8 @@ struct FakeScenes : Scenes {
         return !fail;
     }
     void unpublish(const TargetSpec &t) override { calls.push_back("unpublish " + t.name); }
+    int resends = 0;
+    void resent(const TargetSpec &, int64_t) override { resends++; }
 };
 
 static const uint64_t kMapScene = 0x010004f0, kPanelScene = 0x01000400;
@@ -433,7 +435,7 @@ static void lost_to_our_own_id()
     b.slot(kPanelSlot, 1, 0);
     b.m.tick(b.now);
     ok("the next report shows it free: the loss was ours, evidence, and a retry after the removal wait",
-       evidence.size() == 1 && evidence[0] == std::string("scene removed") && b.m.status(1).retry_ms == b.now + 5000);
+       evidence.size() == 1 && evidence[0] == std::string("scene removed") && b.m.status(1).retry_ms == b.now + SlotManager::kRemovalWaitMs);
 
     Rig c;
     evidence.clear();
@@ -443,7 +445,7 @@ static void lost_to_our_own_id()
     const bool waited = evidence.empty();
     c.run(20);
     ok("no report within 1 s: the loss was ours", waited && evidence.size() == 1);
-    ok("and the wait counts from the loss", c.m.status(1).retry_ms == c.now - 1010 + 5000);
+    ok("and the wait counts from the loss", c.m.status(1).retry_ms == c.now - 1010 + SlotManager::kRemovalWaitMs);
 
     Rig d;
     std::vector<std::string> ev2;
@@ -454,7 +456,7 @@ static void lost_to_our_own_id()
     d.slot(kMapSlot, 1, kMapScene);   /* a removal: the slot available, our content still named */
     d.m.on_lost(kMapScene, "fetch removed", d.now);
     ok("removed with the slot shown available: evidence at once, and the removal wait",
-       ev2.size() == 1 && d.m.status(0).retry_ms == d.now + 5000);
+       ev2.size() == 1 && d.m.status(0).retry_ms == d.now + SlotManager::kRemovalWaitMs);
 }
 
 static void lock_is_not_evidence()
@@ -990,7 +992,9 @@ static void fresh_fetch_failed()
 }
 
 /* On the car: the KOMBI removed the shown map scene, failed the fetch asked
- * 2 s later within 125 ms, and took the one asked 7 s after the removal. */
+ * 2 s later within 125 ms, and took the one asked 7 s after the removal:
+ * asked at 2 s and again 1.5 s after each quick failure, the fourth retry
+ * comes at about 8.5 s. */
 static void removal_retry()
 {
     Rig r;
@@ -1001,10 +1005,10 @@ static void removal_retry()
     r.m.on_lost(kMapScene, "fetch removed", r.now);
     const int64_t removed = r.now;
     joined();
-    r.run(4990);
-    ok("a scene the display removed: not asked for again within 5 s", calls_are(""));
+    r.run(1990);
+    ok("a scene the display removed: not asked for again within 2 s", calls_are(""));
     r.run(10);
-    ok("then asked for", calls_are("request map") && r.now - removed == 5000);
+    ok("then asked for", calls_are("request map") && r.now - removed == 2000);
     bool quick = true;
     for (int k = 0; k < SlotManager::kNotReadyRetries; k++) {
         r.run(130);
@@ -1016,15 +1020,18 @@ static void removal_retry()
         r.run(10);
         quick = quick && calls_are("request map") && r.now - at == 1500;
     }
-    ok("a fetch failing within 300 ms of it: not ready, asked again after 1.5 s, three times", quick);
+    ok("a fetch failing within 300 ms of it: not ready, asked again after 1.5 s, four times", quick);
+    ok("no resend charged while the display fails the fetches", r.scenes.resends == 0);
     r.run(130);
     r.m.on_refused(kMapScene, Refusal::FetchFailed, "E_FETCH_STATUS_FAILED", r.now);
     const int64_t at = r.now;
     joined();
     r.run(4990);
-    ok("the fourth: the ladder's next step", calls_are(""));
+    ok("the fifth: the ladder's next step", calls_are(""));
     r.run(10);
     ok("5 s", calls_are("request map") && r.now - at == 5000);
+    r.m.on_shown(kMapScene, r.now);
+    ok("charged once when the display takes it", r.scenes.resends == 1);
 
     Rig s;   /* failing later than 300 ms after the request: a refusal, the ladder */
     s.m.want(0, true, false);

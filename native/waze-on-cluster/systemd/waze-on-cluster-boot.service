@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Robert Nisipeanu
+[Unit]
+Description=waze-on-cluster boot check: restore the original carplay before it starts if the map patch crash-loops
+RequiresMountsFor=/var/opt
+After=local-fs.target
+# carplay.service (WantedBy=late.target, after multi-user.target) starts only
+# once this has finished, failed or timed out; it does not require it.
+Before=carplay.service
+
+[Service]
+# Root, like patchd: at the crash threshold it remounts / read-write only to
+# run the vetted carplay_patch.js revert, then read-only again (PATCH.md "Boot
+# recovery"). Otherwise it reads the counter and exits in about a second.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/bin/node /var/opt/waze-on-cluster/current/recovery.js boot
+# Below the threshold carplay waits about the time Node takes to start; a
+# restore takes seconds. Every command a restore runs is bounded, so it ends
+# within 71 s (recovery.js RESTORE_BOUND_MS), inside the start timeout: carplay
+# is held back 90 s at most, and only when those commands hang. A stop
+# mid-restore lets it finish, inside the stop timeout, so / is not left
+# writable; KillMode=mixed signals only the step, not its mount/revert children.
+TimeoutStartSec=90
+TimeoutStopSec=90
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

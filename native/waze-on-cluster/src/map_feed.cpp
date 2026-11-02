@@ -11,6 +11,8 @@
 
 namespace woc {
 
+const char *const MapFeed::kWaiting = "Waiting for the phone's map — start navigation";
+
 namespace {
 
 /* The size of a target in the renderer's hello ("map:1088x480,panel:..."). */
@@ -92,7 +94,7 @@ void MapFeed::make_layer()
     lo_.y = (int)q.y;
     lo_.w = q.w;
     lo_.h = q.h;
-    lo_.visible = live_ && !frozen_;
+    lo_.visible = live_ && !frozen_ && picture_ == Picture::Shown;
     refused_.clear();
     layer_state_ = "stalled";
     layer_reason_.clear();
@@ -156,14 +158,22 @@ void MapFeed::offer(std::vector<uint8_t> *atlas, uint64_t id, int64_t now_ms)
     count_second(now_ms);
 }
 
-void MapFeed::set_stream(bool live, bool frozen)
+void MapFeed::set_stream(bool live, bool frozen, Picture picture)
 {
-    if (live == live_ && frozen == frozen_)
+    if (live == live_ && frozen == frozen_ && picture == picture_)
         return;
-    log_info("render: CarPlay's cluster stream %s", !live ? "is not live" : frozen ? "froze" : "is live");
+    const char *line = !live                       ? "is not live"
+                       : frozen                    ? "froze"
+                       : picture == Picture::None  ? "is live, no frame yet"
+                       : picture == Picture::Blank ? "is live, its picture blank"
+                                                   : "is live, with a picture";
+    if (line != stream_line_)   /* frames after the stream ends change only the verdicts */
+        log_info("render: CarPlay's cluster stream %s", line);
+    stream_line_ = line;
     live_ = live;
     frozen_ = frozen;
-    const bool visible = live && !frozen;
+    picture_ = picture;
+    const bool visible = live && !frozen && picture == Picture::Shown;
     if (layer_ && lo_.visible != visible) {
         lo_.visible = visible;
         client_.set(layer_, lo_);
@@ -221,6 +231,13 @@ FeedStatus MapFeed::status(const std::string &decode, const std::string &stream)
     } else if (!live_) {
         s.state = "idle";
         s.page = decode;
+    } else if (picture_ != Picture::Shown) {
+        s.state = "idle";   /* the layer hidden: the stock map shows */
+        s.page = decode;
+        s.reason = stream;
+        s.stream_reason = !stream.empty();
+        if (stream.empty() && picture_ == Picture::Blank)
+            s.reason = kWaiting;
     } else if (layer_state_ == "shown") {
         s.state = "showing";
         char p[400];

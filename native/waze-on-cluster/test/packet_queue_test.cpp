@@ -11,6 +11,7 @@
  * frame. */
 #include <algorithm>
 #include <cstdio>
+#include <future>
 #include <thread>
 
 #include "../src/packet_queue.h"
@@ -228,7 +229,11 @@ int main()
     }
     {
         const uint32_t frames = 60;
-        const Run slow = simulate(frames, 60, 4, 30, true);
+        /* Independent runs, each with its own queue and threads, at once. */
+        auto slow_run = std::async(std::launch::async, simulate, frames, 60u, 4, 30, true);
+        auto behind_run = std::async(std::launch::async, simulate, frames, 60u, 4, 30, false);
+        auto fast_run = std::async(std::launch::async, simulate, 20u, 20u, 2, 3, true);
+        const Run slow = slow_run.get();
         std::printf("     slow decoder with catch-up: %u of %u frames shown, packets waited at most %lld ms\n",
                     slow.pictures, slow.decoded, (long long)(slow.max_wait_us / 1000));
         ok("a decoder slower than the stream: every frame decoded in order, none lost to the queue",
@@ -236,11 +241,11 @@ int main()
         ok("it skips pictures, and the newest frame gets one",
            slow.pictures > 0 && slow.pictures < slow.decoded && slow.last_picture == frames - 1);
         ok("the wait stays bounded", slow.max_wait_us < 250000);
-        const Run behind = simulate(frames, 60, 4, 30, false);
+        const Run behind = behind_run.get();
         std::printf("     the same without catch-up: packets waited at most %lld ms\n",
                     (long long)(behind.max_wait_us / 1000));
         ok("without catch-up the same decoder falls ever further behind", behind.max_wait_us > 500000);
-        const Run fast = simulate(20, 20, 2, 3, true);
+        const Run fast = fast_run.get();
         std::printf("     a fast decoder at 20 frames a second: %u of %u frames shown, packets waited at most %lld ms\n",
                     fast.pictures, fast.decoded, (long long)(fast.max_wait_us / 1000));
         ok("a decoder faster than the stream shows every frame",

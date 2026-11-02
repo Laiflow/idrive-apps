@@ -95,6 +95,19 @@ std::string Governor::summary() const
     return s;
 }
 
+/* A removal in the window holds the cap kRemovalHoldMs from now_ms; the
+ * reason's suffix for it. */
+std::string Governor::hold(int64_t now_ms)
+{
+    for (const Event &e : events_) {
+        if (e.kind == Evidence::Removal) {
+            hold_until_ms_ = now_ms + kRemovalHoldMs;
+            return "; held " + std::to_string(kRemovalHoldMs / 60000) + " min";
+        }
+    }
+    return "";
+}
+
 bool Governor::tick(int64_t now_ms)
 {
     if (cfg_.max_bps == 0)
@@ -105,7 +118,7 @@ bool Governor::tick(int64_t now_ms)
 
     if (s >= kThreshold && now_ms >= cooldown_until_ms_) {
         if (cap_ <= cfg_.floor_bps) {
-            reason_ = "at the floor; in " + std::to_string(kWindowMs / 1000) + " s: " + summary();
+            reason_ = "at the floor; in " + std::to_string(kWindowMs / 1000) + " s: " + summary() + hold(now_ms);
             events_.clear();
             cooldown_until_ms_ = now_ms + kCooldownMs;
             return false;
@@ -114,7 +127,8 @@ bool Governor::tick(int64_t now_ms)
         cap_ = cap_ > cfg_.floor_bps + cfg_.step_bps ? cap_ - cfg_.step_bps : cfg_.floor_bps;
         if (last_up_ms_ >= 0 && now_ms - last_up_ms_ < kProbationMs)
             recover_ms_ = std::min(recover_ms_ * 2, kRecoverMaxMs);
-        reason_ = "lowered from " + kb(was) + ": in " + std::to_string(kWindowMs / 1000) + " s, " + summary();
+        reason_ = "lowered from " + kb(was) + ": in " + std::to_string(kWindowMs / 1000) + " s, " + summary() +
+                  hold(now_ms);
         log_warn("upload: cap %s, %s", kb(cap_).c_str(), reason_.c_str());
         events_.clear();
         cooldown_until_ms_ = now_ms + kCooldownMs;
@@ -129,7 +143,7 @@ bool Governor::tick(int64_t now_ms)
      * proves nothing either way. */
     if (s == 0 && last_active_ms_ >= 0 && now_ms - last_active_ms_ <= kActiveMs)
         healthy_ms_ += dt;
-    if (cap_ < cfg_.max_bps && healthy_ms_ >= recover_ms_) {
+    if (cap_ < cfg_.max_bps && healthy_ms_ >= recover_ms_ && now_ms >= hold_until_ms_) {
         const uint64_t was = cap_;
         cap_ = std::min(cap_ + cfg_.step_bps, cfg_.max_bps);
         reason_ = "raised from " + kb(was) + " after " + std::to_string(recover_ms_ / 1000) + " s healthy";

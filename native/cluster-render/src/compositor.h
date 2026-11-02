@@ -39,7 +39,7 @@
  * subscribes gets the scene whole, as last flushed, from the RAMSES client
  * (VERIFIED in the emulator: sent at the subscription), so a video writes
  * the tiles that differ from it, not the whole frame. That resend is
- * charged to the byte budget when the scene is asked for (resent()). */
+ * charged to the byte budget when the display takes the scene (resent()). */
 #ifndef CRS_COMPOSITOR_H
 #define CRS_COMPOSITOR_H
 

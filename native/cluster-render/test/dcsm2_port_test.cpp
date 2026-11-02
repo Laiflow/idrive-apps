@@ -248,7 +248,7 @@ static void basics()
     calls.clear();
 
     /* Now the stock map takes it: arbitration, not evidence. The removal
-     * is asked for again 5 s after it. */
+     * is asked for again on the ladder, 5 s after it here. */
     r.now += 5000;
     r.tick();
     r.port.on_reply(dcsm::kReqFetchContent, true, dcsm::E_DCSM_OK, "E_DCSM_OK", r.now);

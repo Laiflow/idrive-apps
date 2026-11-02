@@ -8,7 +8,7 @@ var helper = path.join(__dirname, '..', 'dlt_capture.js');
 var children = [], sockets = [], modes = [], behavior = 'ok', tcp;
 var env = Object.assign({}, process.env, {
     WOC_CAPTURE_DIR: path.join(dir, 'capture'), WOC_DLT_SOCKET: path.join(dir, 'ctrl'),
-    WOC_TRACE_DIR: dir, WOC_CAPTURE_MS: '900',
+    WOC_TRACE_DIR: dir, WOC_CAPTURE_MS: '400',
     WOC_CAPTURE_RETRY_MS: '80', WOC_DLT_PROC: path.join(dir,'proc')
 });
 function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }

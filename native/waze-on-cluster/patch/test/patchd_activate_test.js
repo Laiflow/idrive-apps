@@ -8,8 +8,8 @@
  * recmgr would allow it; the running binary stays linked and / goes read-only
  * again; a second run changes nothing; after that start the patch is left as
  * it is, a user's revert is kept, an older patch of ours is brought up to
- * date, a stock build outside the proven list is patched like the proven
- * one. Removal (deactivate) reverts and drops our backup: before the pending
+ * date, a stock build outside the proven list is left as a conflict until
+ * Enable map patched it, then patched like the proven one. Removal (deactivate) reverts and drops our backup: before the pending
  * start it moves carplay's running file back and leaves nothing pending;
  * while carplay runs the patch it keeps that file linked and hands it to the
  * deploy tool (removeWhenUnused); with carplay not running it keeps nothing;
@@ -417,14 +417,38 @@ async function main() {
     r = hook('deactivate');
     ok('unpatchable binary: deactivate leaves it, exit 0', r.code === 0 && disk() === sha(unknown), JSON.stringify(r.result));
 
+    /* What an older release patched where the locator now refuses a site
+     * (with its backup and record): activate leaves it, a conflict; the
+     * removal restores the original whole and drops the backup. */
+    if (sha(SRCBUF) === 'ddb33e33161387c6479c391684b3d019b0de54ecfcee8d6877eca94aa62f3e50') {
+        var locate = require('../carplay_locate.js');
+        require('./carplay_mutations.js')(SRCBUF).oldRelease().forEach(function (f) {
+            fresh(f.patched);
+            fs.writeFileSync(BAK, f.original, { mode: 0o600 });
+            fs.writeFileSync(TGT + '.woc-orig.json', JSON.stringify({ buildId: locate.buildId(f.original), sha256_original: sha(f.original) }));
+            r = hook('activate');
+            ok(f.name + ': activate leaves it, conflict, exit 0', r.code === 0 && fs.readFileSync(TGT).equals(f.patched) &&
+                /^not patchable: /.test(r.result.conflict || '') && !r.result.reboot && ro(), JSON.stringify(r.result));
+            r = hook('deactivate');
+            ok(f.name + ': deactivate restores the original, drops the backup, pending', r.code === 0 && fs.readFileSync(TGT).equals(f.original) &&
+                !fs.existsSync(BAK) && !fs.existsSync(TGT + '.woc-orig.json') && marker() && marker().action === 'revert' && ro(), JSON.stringify(r.result));
+        });
+    }
+
     /* A build outside the proven list with every site stock: a fresh install
-     * patches it. */
+     * leaves it, a conflict; once Enable map patched it (our backup), an
+     * install brings the patch up to date. */
     var other = Buffer.from(SRCBUF);
     other[other.indexOf(Buffer.from('5de62156575d737391ea42254e778a97dbbb51f8', 'hex'))] ^= 0xff;
     Buffer.from('e900000000', 'hex').copy(other, 0x9f9a0);
     fresh(other);
     r = hook('activate');
-    ok('another build: activate writes Enable map\'s patch, pending', r.code === 0 && !r.result.conflict && marker() && marker().action === 'apply' &&
+    ok('another build: activate leaves it, conflict, exit 0', r.code === 0 && disk() === sha(other) && !marker() &&
+        r.result.conflict === 'untested carplay build' && !r.result.reboot && ro(), JSON.stringify(r.result));
+    cp.execFileSync(process.execPath, [path.join(__dirname, '..', 'carplay_patch.js'), 'apply', '--target', TGT, '--panel', 'mid', '--unproven', '--yes']);
+    headUnitStart();
+    r = hook('activate');
+    ok('another build Enable map patched: activate writes Enable map\'s patch, pending', r.code === 0 && !r.result.conflict && marker() && marker().action === 'apply' &&
         slot() === 'bcf2f7ff' && /OK: variant IC_HIGH, sink original \(AVB 15\), self-start on, res 1088x480/.test(verify()) && ro(), JSON.stringify(r.result));
     r = hook('deactivate');
     ok('another build: deactivate restores it byte-exact', r.code === 0 && disk() === sha(other) && !fs.existsSync(BAK), JSON.stringify(r.result));

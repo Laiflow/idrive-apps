@@ -45,7 +45,9 @@ or by hand (Actions, Release, with the component ids or none for all), from
 `main`, with the workflow's `GITHUB_TOKEN` (`contents: write`). It publishes
 whether this repository is private or public
 (`MGU_PUBLISH_VISIBILITY=any`). `.github/workflows/test.yml` runs every
-test, both head-unit builds and `check` on every push and pull request.
+test on each push to main and builds every component twice from a clean
+export, on two runners, comparing the artifacts as `check` does; a pull
+request runs the tests and the double build of the components it changes.
 
 ## License
 

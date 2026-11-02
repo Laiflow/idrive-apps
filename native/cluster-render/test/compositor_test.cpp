@@ -273,7 +273,7 @@ static void warm_scene()
     r.step(10);
     ok("taken by the display: released, the scene kept",
        g && r.port.releases == 1 && r.g("map") == g && r.slots.status(r.map).state == TargetState::Waiting);
-    /* Frames keep coming while it waits after the removal (5 s): two tiles
+    /* Frames keep coming while it waits after the removal (2 s): two tiles
      * change. */
     std::vector<uint8_t> c = a;
     for (uint32_t y = 0; y < 64; y++)
@@ -282,7 +282,7 @@ static void warm_scene()
             c[(size_t)(y + 256) * W + x + 512] += 40;
         }
     const uint64_t f0 = g->flushes, b0 = g->flushed_bytes;
-    for (int k = 0; k < 49; k++) {
+    for (int k = 0; k < 19; k++) {
         vl->offer(c.data(), r.now);
         r.run(100);
     }
@@ -593,12 +593,19 @@ static void warm_scene_charged()
     r.slots.on_lost(0x010004f0, "fetch removed", r.now);
     a[W * 300] += 40;
     vl->offer(a.data(), r.now);
+    const uint64_t b1 = g->flushed_bytes;
     while (r.port.requests < 2)
         r.step(10);
-    /* Asked for again with a full burst: the resend of atlas and banks
-     * (1,305,600 B) leaves 793,600 B of debt, 388 ms. */
+    r.step(10);
+    ok("a warm scene asked for again: its newest frame flushed at once, nothing charged until the display takes it",
+       g->flushed_bytes > b1);
+    /* Taken with nearly a full burst: the resend of atlas and banks
+     * (1,305,600 B) leaves about 800,000 B of debt, about 390 ms. */
+    r.slots.on_shown(0x010004f0, r.now);
+    a[W * 100] += 40;
+    vl->offer(a.data(), r.now);
     const int64_t warm = until_written(r, g);
-    ok("a warm scene asked for again: its resend charged, the next write after 380-400 ms",
+    ok("taken: its resend charged, the next write after 380-400 ms",
        atlas + banks == 1305600 && warm >= 380 && warm <= 400);
 }
 
